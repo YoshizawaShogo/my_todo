@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>my_todo</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top_bar">
+    <h1>my_todo</h1>
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab" role="tab" data-tab="gantt">線表</button>
+      <button type="button" class="tab" role="tab" data-tab="list">詳細</button>
+      <button type="button" class="tab" role="tab" data-tab="work">工数記録</button>
+    </nav>
+    <div class="undo_buttons">
+      <button type="button" class="icon_button" id="undo_button" title="元に戻す（Ctrl+Z）">↩️</button>
+      <button type="button" class="icon_button" id="redo_button" title="やり直し（Ctrl+Y）">↪️</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <div class="lists">
+      <!-- 線表 -->
+      <div class="view" id="view_gantt" hidden>
+        <section class="list_section gantt_section">
+          <div class="gantt_toolbar">
+            <button type="button" class="small_button" id="gantt_prev">◀ 前の週</button>
+            <button type="button" class="small_button" id="gantt_today">今日</button>
+            <button type="button" class="small_button" id="gantt_next">次の週 ▶</button>
+            <span class="gantt_range" id="gantt_range"></span>
+            <span class="gantt_legend">
+              <span class="legend_bar todo"></span>未着手
+              <span class="legend_bar doing"></span>作業中
+              <span class="legend_bar done"></span>完了
+              <span class="legend_bar summary"></span>子の範囲
+              <span class="legend_mark">◆</span>終了日のみ
+              <span class="legend_mark next">▶</span>次の予定
+            </span>
+          </div>
+          <div class="gantt_filter">
+            <input id="gfilter_text" class="filter_text" type="search" placeholder="絞り込み（キーワード）" autocomplete="off">
+            <div id="gfilter_tags" class="filter_tags"></div>
+            <label class="toggle"><input id="gfilter_hide_done" type="checkbox"> 完了を隠す</label>
+            <button id="gfilter_clear" class="small_button" type="button" hidden>解除</button>
+          </div>
+          <div class="gantt_scroll" id="gantt"></div>
+          <p class="empty_hint gantt_hint">
+            時間軸の上でホイールを回すと表示範囲が前後に動きます（名前欄の上では上下にスクロール）。
+            名前をドラッグで並べ替え・階層変更（行の中央に落とすと子になる）。ダブルクリックで名前を変更。
+            日付のない行は右側を横にドラッグすると期間を決められます。バーはドラッグで移動、端をドラッグで期間を変更。
+            完了したタスクは予定の期間（なければ着手〜完了）を緑で表示します。
+          </p>
+        </section>
+        <section class="list_section inbox_section">
+          <h2 class="section_title" id="inbox_header" title="ここに落とすと未分類へ戻す">未分類
+            <button type="button" class="small_button" id="inbox_add" title="未分類に追加（/ キー）">➕ 追加</button>
+          </h2>
+          <div class="inbox_list" id="inbox_list"></div>
+        </section>
+      </div>
+
+      <!-- 詳細 -->
+      <div class="view" id="view_list" hidden>
+        <section class="list_section list_filter_section">
+          <div class="preset_bar" id="list_presets"></div>
+          <div class="list_filter" id="list_filter">
+            <div class="filter_row">
+              <span class="filter_label">キーワード</span>
+              <input id="lf_text" class="filter_text wide" type="search" placeholder="名前・メモ・次の予定・タグ・親の名前（空白区切りですべて含む）" autocomplete="off">
+            </div>
+            <div class="filter_row">
+              <span class="filter_label">状態</span>
+              <div class="chip_group" id="lf_status"></div>
+              <label class="toggle"><input id="lf_doing_always" type="checkbox"> 作業中は日付に関係なく含める</label>
+            </div>
+            <div class="filter_row">
+              <span class="filter_label">日付</span>
+              <select id="lf_date_field">
+                <option value="plan">予定（開始〜終了・次の予定）</option>
+                <option value="planned_start">開始予定日</option>
+                <option value="planned_end">終了予定日</option>
+                <option value="next_action_date">次の予定</option>
+                <option value="completed_at">完了日</option>
+                <option value="started_at">着手日</option>
+                <option value="created_at">登録日</option>
+              </select>
+              <div class="chip_group" id="lf_range"></div>
+              <span id="lf_custom" class="custom_range" hidden>
+                <input id="lf_from" type="date"> 〜 <input id="lf_to" type="date">
+              </span>
+            </div>
+            <div class="filter_row">
+              <span class="filter_label">タグ</span>
+              <div class="chip_group" id="lf_tags"></div>
+              <select id="lf_tag_mode" title="複数のタグを選んだときの条件">
+                <option value="any">いずれかを含む</option>
+                <option value="all">すべて含む</option>
+                <option value="none">含まない</option>
+              </select>
+            </div>
+            <div class="filter_row">
+              <span class="filter_label">場所</span>
+              <select id="lf_section">
+                <option value="all">すべて</option>
+                <option value="tasks">タスク</option>
+                <option value="inbox">未分類</option>
+              </select>
+              <select id="lf_parent"></select>
+            </div>
+            <div class="filter_row">
+              <span class="filter_label">表示</span>
+              <select id="lf_group">
+                <option value="none">グループなし</option>
+                <option value="date">日付ごと</option>
+                <option value="status">状態ごと</option>
+                <option value="parent">親ごと</option>
+                <option value="tag">タグごと</option>
+              </select>
+              <span class="list_count" id="list_count"></span>
+              <span class="spacer"></span>
+              <button type="button" class="small_button" id="lf_save">⭐ 条件を保存</button>
+              <button type="button" class="small_button" id="lf_reset">条件をリセット</button>
+            </div>
+          </div>
+        </section>
+        <section class="list_section">
+          <div class="list_table_wrap" id="list_table"></div>
+        </section>
+      </div>
+
+      <!-- 工数 -->
+      <div class="view" id="view_work" hidden>
+        <section class="list_section work_section">
+          <div class="work_toolbar">
+            <button type="button" class="small_button" id="work_prev">◀ 前の日</button>
+            <input type="date" id="work_date">
+            <button type="button" class="small_button" id="work_next">次の日 ▶</button>
+            <button type="button" class="small_button" id="work_today">今日</button>
+            <span class="spacer"></span>
+            <span class="work_week_total" id="work_week_total"></span>
+          </div>
+          <div class="week_strip" id="work_week"></div>
+          <div class="work_hours">
+            <span class="filter_label">勤務時間</span>
+            <button type="button" class="icon_button" id="work_minus" title="0.5 時間減らす">−</button>
+            <input type="number" id="work_worked" min="0" max="24" step="0.5">
+            <span>時間</span>
+            <button type="button" class="icon_button" id="work_plus" title="0.5 時間増やす">＋</button>
+            <span class="work_badge" id="work_overtime"></span>
+            <span class="work_badge muted" id="work_state"></span>
+          </div>
+          <p class="empty_hint work_hint">その日の勤務時間（残業込み）を、タスクごとの割合で 0.5 時間刻みに振り分けます。スライダーを動かすと自動で保存します。</p>
+          <div class="work_rows" id="work_rows"></div>
+          <div class="work_add">
+            <input id="work_add_input" class="filter_text wide" list="work_task_options" placeholder="タスクを追加（名前で検索して Enter）" autocomplete="off">
+            <datalist id="work_task_options"></datalist>
+          </div>
+          <div class="work_settings">
+            <span class="filter_label">設定</span>
+            1D =
+            <input type="number" id="setting_day_hours" min="1" max="24" step="0.25"> 時間
+            <span class="toolbar_sep"></span>
+            標準の勤務時間
+            <input type="number" id="setting_default_hours" min="0" max="24" step="0.5"> 時間（平日の初期値）
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <aside id="detail" class="detail" hidden>
+      <div class="detail_header">
+        <h2>詳細</h2>
+        <button id="detail_close" class="icon_button" type="button" title="閉じる">✕</button>
+      </div>
+      <label>タイトル<input id="detail_title" type="text"></label>
+      <div class="tag_editor">
+        <span class="field_label">タグ</span>
+        <div class="tag_box" id="detail_tag_box">
+          <span id="detail_tags" class="tag_list"></span>
+          <input id="detail_tag_input" type="text" list="tag_options" placeholder="タグを追加（Enter）" autocomplete="off">
+        </div>
+        <datalist id="tag_options"></datalist>
+      </div>
+      <label>状態
+        <select id="detail_status">
+          <option value="todo">未着手</option>
+          <option value="doing">作業中</option>
+          <option value="done">完了</option>
+        </select>
+      </label>
+      <div class="date_pair">
+        <label>開始予定日<input id="detail_planned_start" type="date"></label>
+        <label>終了予定日<input id="detail_planned_end" type="date"></label>
+      </div>
+      <div class="effort_box">
+        <label>見積もり<input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></label>
+        <div class="effort_actual" id="detail_actual"></div>
+      </div>
+      <fieldset class="next_action">
+        <legend>次の予定</legend>
+        <div class="next_action_inputs">
+          <input id="detail_next_action_date" type="date" title="いつ">
+          <input id="detail_next_action" type="text" placeholder="何をする（例：課長にレビュー依頼）">
+        </div>
+      </fieldset>
+      <label>メモ<textarea id="detail_note" rows="6"></textarea></label>
+      <details class="history">
+        <summary>記録</summary>
+        <p class="detail_meta" id="detail_meta"></p>
+        <ol id="detail_history" class="history_list"></ol>
+      </details>
+      <button id="detail_delete" class="danger_button" type="button">🗑️ このタスクを削除</button>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js"></script>
+  <script src="/datepicker.js"></script>
+  <script src="/gantt.js"></script>
+  <script src="/list.js"></script>
+  <script src="/work.js"></script>
+  <script>setup();</script>
+</body>
+</html>
