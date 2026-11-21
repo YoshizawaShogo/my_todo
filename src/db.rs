@@ -10,12 +10,15 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/003_tags.sql"),
     include_str!("../migrations/004_undo.sql"),
     include_str!("../migrations/005_time_tracking.sql"),
+    include_str!("../migrations/006_jira.sql"),
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("データベースを開けません: {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // 画面（serve）と MCP（mcp）が別プロセスで同じファイルを開くので、書き込みが重なったら待つ
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     prepare(conn)
 }
 

@@ -82,6 +82,8 @@ pub struct Task {
     pub tags: Vec<String>,
     /// 記録した工数の合計（分。自分の分だけで、子は含まない）
     pub actual_min: i64,
+    /// 紐付けた Jira の課題キー（例：ABC-123）
+    pub jira_key: Option<String>,
 }
 
 /// 登録に必要なのはタイトルだけ。親を指定しなければ未分類に入る。
@@ -122,6 +124,9 @@ pub struct TaskPatch {
     /// 見積もり（分）
     #[serde(default, deserialize_with = "double_option")]
     pub estimate_min: Option<Option<i64>>,
+    /// Jira の課題キー（空文字か null で紐付けを外す）
+    #[serde(default, deserialize_with = "double_option")]
+    pub jira_key: Option<Option<String>>,
 }
 
 /// タグと、それが付いているタスクの数
@@ -137,7 +142,7 @@ pub struct TaskEvent {
     pub id: i64,
     pub task_id: i64,
     pub at: String,
-    /// created / title / status / planned_start / planned_end / next_action / tags / estimate
+    /// created / title / status / planned_start / planned_end / next_action / tags / estimate / jira
     pub kind: String,
     pub old_value: Option<String>,
     pub new_value: Option<String>,

@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, Duration, NaiveDate};
+use jiff::ToSpan;
+use jiff::civil::Date;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -49,26 +50,25 @@ pub struct Agenda {
     pub next_week: Vec<AgendaItem>,
 }
 
-fn parse_date(s: &Option<String>) -> Option<NaiveDate> {
-    s.as_deref()
-        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+fn parse_date(s: &Option<String>) -> Option<Date> {
+    s.as_deref().and_then(|d| super::parse_date(d).ok())
 }
 
-fn ymd(d: NaiveDate) -> String {
-    d.format("%Y-%m-%d").to_string()
+fn ymd(d: Date) -> String {
+    d.to_string()
 }
 
 /// 週は月曜始まり・日曜終わり
-fn week_end_of(d: NaiveDate) -> NaiveDate {
-    d + Duration::days(6 - d.weekday().num_days_from_monday() as i64)
+fn week_end_of(d: Date) -> Date {
+    d + (6 - i64::from(d.weekday().to_monday_zero_offset())).days()
 }
 
-pub fn agenda(conn: &Connection, today: NaiveDate) -> ServiceResult<Agenda> {
+pub fn agenda(conn: &Connection, today: Date) -> ServiceResult<Agenda> {
     let tasks = task_service::list_tasks(conn)?;
     Ok(build_agenda(&tasks, today))
 }
 
-pub fn build_agenda(tasks: &[Task], today: NaiveDate) -> Agenda {
+pub fn build_agenda(tasks: &[Task], today: Date) -> Agenda {
     let by_id: HashMap<i64, &Task> = tasks.iter().map(|t| (t.id, t)).collect();
     let path_of = |task: &Task| {
         let mut path = Vec::new();
@@ -82,7 +82,7 @@ pub fn build_agenda(tasks: &[Task], today: NaiveDate) -> Agenda {
     };
 
     let week_end = week_end_of(today);
-    let next_week_end = week_end + Duration::days(7);
+    let next_week_end = week_end + 7.days();
     let mut agenda = Agenda {
         today: ymd(today),
         week_end: ymd(week_end),
@@ -94,7 +94,7 @@ pub fn build_agenda(tasks: &[Task], today: NaiveDate) -> Agenda {
     };
 
     for task in tasks.iter().filter(|t| t.status != TaskStatus::Done) {
-        let item = |kind, date: Option<NaiveDate>, text: Option<String>| AgendaItem {
+        let item = |kind, date: Option<Date>, text: Option<String>| AgendaItem {
             task_id: task.id,
             title: task.title.clone(),
             path: path_of(task),
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn week_ends_on_sunday() {
-        let d = |s| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let d = |s| super::super::parse_date(s).unwrap();
         assert_eq!(week_end_of(d("2026-11-20")), d("2026-11-22")); // 金 → 日
         assert_eq!(week_end_of(d("2026-11-22")), d("2026-11-22")); // 日 → 同じ日
         assert_eq!(week_end_of(d("2026-11-23")), d("2026-11-29")); // 月 → 次の日
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn items_are_bucketed_by_date() {
         let conn = db::open_in_memory().unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap(); // 金曜
+        let today = jiff::civil::date(2026, 11, 20); // 金曜
         let p = add(&conn, "資料作成", None, r#"{"planned_end":"2026-11-27"}"#);
         add(
             &conn,
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn doing_task_with_today_item_is_not_duplicated() {
         let conn = db::open_in_memory().unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let today = jiff::civil::date(2026, 11, 20);
         add(
             &conn,
             "a",

@@ -1,4 +1,6 @@
 mod db;
+mod jira;
+mod mcp;
 mod model;
 mod service;
 mod web;
@@ -12,6 +14,7 @@ const USAGE: &str = "\
 
 サブコマンド:
   serve            ローカル Web アプリを起動する（既定）
+  mcp              MCP サーバーとして標準入出力で待ち受ける（AI から使う）
 
 オプション:
   --db <PATH>      データベースファイル（既定: 実行ファイルと同じ場所の my_todo.db。
@@ -20,7 +23,14 @@ const USAGE: &str = "\
   --no_open        起動時にブラウザを開かない
   -h, --help       この説明を表示する";
 
+#[derive(PartialEq)]
+enum Mode {
+    Serve,
+    Mcp,
+}
+
 struct Options {
+    mode: Mode,
     db_path: PathBuf,
     port: u16,
     open_browser: bool,
@@ -46,6 +56,7 @@ fn is_cargo_target_dir(dir: &std::path::Path) -> bool {
 
 fn parse_args() -> Result<Option<Options>> {
     let mut opts = Options {
+        mode: Mode::Serve,
         db_path: default_db_path(),
         port: 8765,
         open_browser: true,
@@ -53,7 +64,8 @@ fn parse_args() -> Result<Option<Options>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "serve" => {}
+            "serve" => opts.mode = Mode::Serve,
+            "mcp" => opts.mode = Mode::Mcp,
             "--db" => opts.db_path = args.next().context("--db に値がありません")?.into(),
             "--port" => {
                 opts.port = args
@@ -79,6 +91,15 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     let conn = db::open(&opts.db_path)?;
-    println!("my_todo: データベース {}", opts.db_path.display());
-    web::serve(conn, opts.port, opts.open_browser).await
+    match opts.mode {
+        // 標準出力は JSON-RPC 専用なので、案内は標準エラーへ
+        Mode::Mcp => {
+            eprintln!("my_todo mcp: データベース {}", opts.db_path.display());
+            tokio::task::block_in_place(|| mcp::run(&conn))
+        }
+        Mode::Serve => {
+            println!("my_todo: データベース {}", opts.db_path.display());
+            web::serve(conn, opts.db_path, opts.port, opts.open_browser).await
+        }
+    }
 }

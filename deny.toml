@@ -1,0 +1,54 @@
+# cargo-deny の設定。`cargo deny check` で、依存クレートのライセンス・脆弱性・重複・取得元を確かめる。
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# 使う環境（会社の Windows）と、開発に使う環境（WSL の Linux）だけを見る
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# RustSec の脆弱性データベース。脆弱性と、メンテナンスされなくなったクレートを知らせる
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# このアプリは MIT OR Apache-2.0 で配布する。同じように寛容なライセンスだけを許す
+# （コピーレフト（GPL・LGPL など）は入れない。r-efi は MIT との選択式なので MIT として扱われる）
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+ignore = true # このアプリ自体（publish しない）はライセンス確認の対象外
+
+[bans]
+# 同じクレートの複数バージョンは知らせるだけ（依存の都合で避けられないことが多い）
+multiple-versions = "warn"
+# Cargo.toml でのバージョン指定に * を使わない
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# 依存は crates.io からだけ取る（知らない registry や git は使わない）
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

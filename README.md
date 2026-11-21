@@ -1,6 +1,6 @@
 # my_todo
 
-自分の工数を自分のために管理する、Rust 製のローカル Web アプリ。開発プランは [docs/development_plan.md](docs/development_plan.md) を参照。
+自分の工数を自分のために管理する、Rust 製のローカル Web アプリ。開発プランは手元の docs/development_plan.md（リポジトリには入れていない）。
 
 現在はフェーズ 1（土台と気軽な登録）まで実装済み。
 
@@ -22,7 +22,7 @@ cargo run --release
 
 ## 画面の操作
 
-上部のタブで「線表」「詳細」「工数記録」を切り替える。右の詳細パネルはどのタブでも共通。
+上部のタブで「線表」「詳細」「工数記録」「Jira」「ヘルプ」を切り替える。操作の説明はアプリの「ヘルプ」タブにもある。右の詳細パネルはどのタブでも共通。
 ヘッダー右の ↶ ↷ か **Ctrl+Z / Ctrl+Y**（Ctrl+Shift+Z も可）で、追加・変更・移動・削除を元に戻す／やり直す（入力欄の中では文字の取り消しになる）。
 
 ### 線表（ふだんはここで完結）
@@ -65,6 +65,29 @@ cargo run --release
 - 見積もりの下に、記録した工数（子を含む）と消化率を出す。見積もりを超えたら赤
 - 「記録」に、登録・着手・完了の日時と変更の履歴が自動で残る（5 分以内の変え直しは 1 件にまとめる）
 
+## AI から使う（MCP）
+
+`my_todo mcp` で MCP サーバー（標準入出力）として動く。画面と同じ DB を共有し、変更は画面の Ctrl+Z でも戻せる。AI のアプリ側に一度登録するだけで、アプリ側の設定は要らない（実際のパス入りの設定例はヘルプタブに出る）。
+
+```
+claude mcp add my_todo -- C:\tools\my_todo\my_todo.exe mcp --db C:\tools\my_todo\my_todo.db
+```
+
+Claude Desktop などの設定ファイルでは：
+
+```json
+{ "mcpServers": { "my_todo": { "command": "C:\\tools\\my_todo\\my_todo.exe", "args": ["mcp", "--db", "C:\\tools\\my_todo\\my_todo.db"] } } }
+```
+
+ツール：`get_schedule`（今日・今週の予定）、`list_tasks`、`get_task`、`add_todo`、`update_task`、`move_task`、`delete_task`、`get_work_day`、`log_work_day`、`list_tags`、`undo`、`redo`
+
+## Jira 連携
+
+- 社内サーバー版（Data Center / Server 8.14 以降）に PAT で接続する（`Authorization: Bearer`、REST API v2）。Cloud 版は `JiraApi` トレイトに実装を足せば対応できる作り
+- PAT は OS の資格情報（Windows の資格情報マネージャーなど）に保存し、DB には保存しない。環境変数 `MY_TODO_JIRA_TOKEN` があればそちらを優先する
+- タスクに課題キーを紐付けると、工数記録の時間を日ごと・課題ごとにまとめて worklog として送る。課題キーのない子タスクは、紐付けた一番近い親の課題に合算する
+- 「下書き → 送信」の 2 段階。送った worklog を覚えておき、工数が変われば更新、0 になれば削除する（二重送信しない）
+
 ## Windows 向けビルド
 
 単一の `my_todo.exe` になる（SQLite と画面は .exe に同梱）。
@@ -86,7 +109,9 @@ src/db.rs               DB の接続とマイグレーション
 src/model.rs            タスクなどの型
 src/service/            サービス層（画面・MCP・Jira 連携の共通ロジック。通信に依存しない）
 src/web/                HTTP サーバーと REST API
-src/web/static/         画面（共通は app.js、線表は gantt.js、詳細タブは list.js、工数記録タブは work.js、日付の入力は datepicker.js）
+src/mcp.rs              MCP サーバー（my_todo mcp）
+src/jira.rs             Jira との通信と PAT の保管
+src/web/static/         画面（共通は app.js、線表は gantt.js、詳細タブは list.js、工数記録は work.js、Jira は jira.js、ヘルプは help.js、日付の入力は datepicker.js）
 ```
 
 ### REST API
@@ -105,6 +130,26 @@ src/web/static/         画面（共通は app.js、線表は gantt.js、詳細�
 | GET | `/api/work_days/{date}` | その日の勤務時間・振り分け・候補のタスク |
 | PUT | `/api/work_days/{date}` | `{worked_min, allocations: [{task_id, weight}]}` で保存（30 分刻みで振り分け直す） |
 | GET / PATCH | `/api/settings` | `{minutes_per_day, default_work_min}`（1D の時間、標準の勤務時間） |
+| GET / PATCH | `/api/jira` | Jira の URL と PAT の保存先（PATCH は `{base_url?, token?}`。token は返さない） |
+| POST | `/api/jira/test` | 接続テスト（自分のユーザー情報） |
+| GET | `/api/jira/issues/{key}` | 課題の件名と状態 |
+| GET | `/api/jira/draft?from=&to=` | 送る内容の下書き |
+| POST | `/api/jira/send` | `{from, to}` の下書きを送る（差分だけ） |
+| GET | `/api/about` | 実行ファイルと DB の場所 |
 | POST | `/api/undo` | 直前の操作を元に戻す。`{label}`（戻せなければ null） |
 | POST | `/api/redo` | 元に戻した操作をやり直す |
 | GET | `/api/tasks/{id}/events` | 変更履歴（登録・タイトル・状態・終了予定日・次の予定） |
+
+## 確認
+
+```
+cargo test
+cargo clippy --all-targets
+cargo deny check
+```
+
+`cargo deny check` は依存クレートのライセンス（寛容なものだけ許可）・脆弱性（RustSec）・重複・取得元（crates.io のみ）を確かめる。設定は `deny.toml`。
+
+## ライセンス
+
+MIT または Apache-2.0 のどちらか（[LICENSE-MIT](LICENSE-MIT)・[LICENSE-APACHE](LICENSE-APACHE)）。

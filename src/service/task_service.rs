@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{ServiceError, ServiceResult, now_text};
+use super::{ServiceError, ServiceResult, Tx, now_text};
 use crate::model::{
     MoveTarget, NewTask, TagCount, Task, TaskEvent, TaskKind, TaskPatch, TaskStatus,
 };
@@ -33,6 +33,7 @@ fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         next_action_date: row.get(17)?,
         tags: Vec::new(),
         actual_min: 0,
+        jira_key: None,
     })
 }
 
@@ -56,12 +57,36 @@ fn normalize_text(text: Option<String>) -> Option<String> {
 fn normalize_date(date: Option<String>) -> ServiceResult<Option<String>> {
     match normalize_text(date) {
         None => Ok(None),
-        Some(d) => chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d")
-            .map(|v| Some(v.format("%Y-%m-%d").to_string()))
-            .map_err(|_| {
-                ServiceError::Invalid(format!("日付は YYYY-MM-DD で指定してください: {d}"))
-            }),
+        Some(d) => super::parse_date(&d).map(|v| Some(v.to_string())),
     }
+}
+
+/// Jira の課題キーは「英大文字で始まるプロジェクトキー - 番号」（例：ABC-123）。小文字は大文字に直す
+pub fn normalize_issue_key(key: Option<String>) -> ServiceResult<Option<String>> {
+    let Some(k) = normalize_text(key) else {
+        return Ok(None);
+    };
+    let k = k.to_uppercase();
+    let valid = match k.split_once('-') {
+        Some((project, num)) => {
+            project
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && project
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    };
+    if !valid {
+        return Err(ServiceError::Invalid(format!(
+            "Jira の課題キーは ABC-123 のような形で入れてください: {k}"
+        )));
+    }
+    Ok(Some(k))
 }
 
 /// 次の予定を履歴用に 1 つの文字列にまとめる
@@ -96,10 +121,10 @@ fn record_event(
             .optional()?;
         if let Some((last_id, last_at, last_kind, first_old)) = last {
             let recent = match (
-                chrono::DateTime::parse_from_rfc3339(&last_at),
-                chrono::DateTime::parse_from_rfc3339(at),
+                last_at.parse::<jiff::Timestamp>(),
+                at.parse::<jiff::Timestamp>(),
             ) {
-                (Ok(a), Ok(b)) => (b - a).num_seconds() <= EVENT_MERGE_SECONDS,
+                (Ok(a), Ok(b)) => b.duration_since(a).as_secs() <= EVENT_MERGE_SECONDS,
                 _ => false,
             };
             if recent && last_kind == kind {
@@ -210,6 +235,13 @@ pub fn get_task(conn: &Connection, id: i64) -> ServiceResult<Task> {
         [id],
         |r| r.get(0),
     )?;
+    task.jira_key = conn
+        .query_row(
+            "SELECT issue_key FROM jira_link WHERE task_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(task)
 }
 
@@ -296,8 +328,15 @@ pub fn list_tasks(conn: &Connection) -> ServiceResult<Vec<Task>> {
         let (id, min) = row?;
         actual.insert(id, min);
     }
+    let mut links: std::collections::HashMap<i64, String> = Default::default();
+    let mut link_stmt = conn.prepare("SELECT task_id, issue_key FROM jira_link")?;
+    for row in link_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, key) = row?;
+        links.insert(id, key);
+    }
     for t in &mut tasks {
         t.tags = tags.remove(&t.id).unwrap_or_default();
+        t.jira_key = links.remove(&t.id);
         t.actual_min = actual.get(&t.id).copied().unwrap_or(0);
     }
     Ok(tasks)
@@ -329,7 +368,7 @@ pub fn create_task(conn: &Connection, input: NewTask) -> ServiceResult<Task> {
         )?,
     };
     let now = now_text();
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     tx.execute(
         "INSERT INTO task (parent_id, title, is_inbox, sort_order, note, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
@@ -397,6 +436,10 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
     };
 
     let tags = patch.tags.map(normalize_tags);
+    let jira_key = match patch.jira_key {
+        Some(k) => normalize_issue_key(k)?,
+        None => current.jira_key.clone(),
+    };
     let estimate_min = match patch.estimate_min {
         Some(Some(m)) if m < 0 => {
             return Err(ServiceError::Invalid(
@@ -407,7 +450,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
         None => current.estimate_min,
     };
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     if let Some(tags) = &tags
         && *tags != current.tags
     {
@@ -454,6 +497,24 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             "status",
             Some(current.status.as_str()),
             Some(status.as_str()),
+        )?;
+    }
+    if jira_key != current.jira_key {
+        match &jira_key {
+            Some(k) => tx.execute(
+                "INSERT INTO jira_link (task_id, issue_key) VALUES (?1, ?2) \
+                 ON CONFLICT(task_id) DO UPDATE SET issue_key = excluded.issue_key",
+                params![id, k],
+            )?,
+            None => tx.execute("DELETE FROM jira_link WHERE task_id = ?1", [id])?,
+        };
+        record_event(
+            &tx,
+            id,
+            &now,
+            "jira",
+            current.jira_key.as_deref(),
+            jira_key.as_deref(),
         )?;
     }
     if estimate_min != current.estimate_min {
@@ -505,7 +566,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
 
 /// 親の付け替えと並べ替え。自分自身や子孫の下には移動できない。
 pub fn move_task(conn: &Connection, id: i64, target: MoveTarget) -> ServiceResult<Task> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     let task = get_task(&tx, id)?;
 
     if let Some(p) = target.parent_id {
@@ -557,7 +618,7 @@ pub fn move_task(conn: &Connection, id: i64, target: MoveTarget) -> ServiceResul
 
 /// 子孫もまとめて削除する。
 pub fn delete_task(conn: &Connection, id: i64) -> ServiceResult<()> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     let task = get_task(&tx, id)?;
     tx.execute("DELETE FROM task WHERE id = ?1", [id])?;
     let ids = Siblings::of(&task).ids(&tx)?;
@@ -834,6 +895,27 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.kind, "tags");
         assert_eq!(last.new_value.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn jira_key_is_normalized_and_validated() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "a", None);
+        let set = |k: &str| {
+            let p: TaskPatch = serde_json::from_str(&format!(r#"{{"jira_key":{k}}}"#)).unwrap();
+            update_task(&conn, a.id, p)
+        };
+        assert_eq!(
+            set(r#"" abc-12 ""#).unwrap().jira_key.as_deref(),
+            Some("ABC-12")
+        );
+        assert_eq!(
+            list_tasks(&conn).unwrap()[0].jira_key.as_deref(),
+            Some("ABC-12")
+        );
+        assert!(matches!(set(r#""12-ABC""#), Err(ServiceError::Invalid(_))));
+        assert!(matches!(set(r#""ABC""#), Err(ServiceError::Invalid(_))));
+        assert_eq!(set("null").unwrap().jira_key, None);
     }
 
     #[test]

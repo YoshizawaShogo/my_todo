@@ -6,7 +6,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::{ServiceError, ServiceResult, now_text};
+use super::{ServiceError, ServiceResult, Tx, now_text};
 
 /// 振り分けの刻み（分）
 pub const STEP_MIN: i64 = 30;
@@ -72,9 +72,7 @@ pub struct SaveDay {
 }
 
 fn check_date(date: &str) -> ServiceResult<()> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|_| ())
-        .map_err(|_| ServiceError::Invalid(format!("日付は YYYY-MM-DD で指定してください: {date}")))
+    super::parse_date(date).map(|_| ())
 }
 
 // ---------- 設定 ----------
@@ -95,7 +93,7 @@ pub fn get_settings(conn: &Connection) -> ServiceResult<Settings> {
 }
 
 pub fn update_settings(conn: &Connection, patch: SettingsPatch) -> ServiceResult<Settings> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     if let Some(m) = patch.minutes_per_day {
         if !(60..=24 * 60).contains(&m) {
             return Err(ServiceError::Invalid(
@@ -242,7 +240,7 @@ pub fn save_day(conn: &Connection, date: &str, input: SaveDay) -> ServiceResult<
     let weights: Vec<f64> = allocs.iter().map(|a| a.weight).collect();
     let minutes = allocate(input.worked_min, &weights);
     let now = now_text();
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     tx.execute(
         "DELETE FROM time_entry WHERE work_date = ?1 AND source = 'daily'",
         [date],

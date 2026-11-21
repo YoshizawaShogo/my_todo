@@ -358,12 +358,16 @@ function render() {
     b.classList.toggle("active", active);
     b.setAttribute("aria-selected", active);
   }
-  for (const name of ["gantt", "list", "work"]) $("view_" + name).hidden = state.tab !== name;
+  for (const name of TABS) $("view_" + name).hidden = state.tab !== name;
   if (state.tab === "gantt") render_gantt();
   else if (state.tab === "list") render_list();
-  else render_work();
+  else if (state.tab === "work") render_work();
+  else if (state.tab === "jira") render_jira();
+  else render_help();
   render_detail();
 }
+
+const TABS = ["gantt", "list", "work", "jira", "help"];
 
 function switch_tab(tab) {
   if (state.tab === tab) return;
@@ -518,6 +522,16 @@ function render_detail() {
   fill("detail_next_action_date", task.next_action_date);
   fill("detail_next_action", task.next_action);
   $("detail_status").value = task.status;
+  fill("detail_jira_key", task.jira_key);
+  const jiraInfo = $("detail_jira_info");
+  if (task.jira_key) {
+    jiraInfo.replaceChildren(jira_key_link(task.jira_key), jira.config?.base_url ? " を Jira で開く" : "（Jira の URL は Jira タブで設定）");
+  } else {
+    // 自分に紐付けがなくても、親の課題に工数がまとまることを知らせる
+    let cur = parent_of(task);
+    while (cur && !cur.jira_key) cur = parent_of(cur);
+    jiraInfo.replaceChildren(cur ? `工数は親の ${cur.jira_key}（${cur.title}）に送られます` : "");
+  }
   fill("detail_estimate", task.estimate_min === null ? "" : fmt_hours(task.estimate_min));
   const actual = subtree_actual(task);
   const parts = [];
@@ -579,6 +593,7 @@ function describe_event(e) {
     case "next_action": return change("次の予定", (v) => v.replace(/^\d{4}-\d{2}-\d{2}/, short_date));
     case "tags": return change("タグ");
     case "estimate": return change("見積もり", (v) => fmt_hours(Number(v)));
+    case "jira": return change("Jira 課題");
     default: return `${e.kind}: ${o ?? ""} → ${n ?? ""}`;
   }
 }
@@ -638,6 +653,19 @@ function setup_detail() {
       }
     });
   }
+  $("detail_jira_key").addEventListener("change", (ev) => {
+    const task = state.byId.get(state.selectedId);
+    const v = ev.target.value.trim();
+    if (task && (task.jira_key ?? "") !== v.toUpperCase()) {
+      update(task.id, { jira_key: v || null }).catch(() => {
+        renderedDetailId = null;
+        render_detail();
+      });
+    }
+  });
+  $("detail_jira_key").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.isComposing) ev.target.blur();
+  });
   $("detail_estimate").addEventListener("change", (ev) => {
     const task = state.byId.get(state.selectedId);
     if (!task) return;
@@ -674,7 +702,7 @@ function setup_detail() {
 // ---------- 起動 ----------
 function setup() {
   setup_date_inputs();
-  if (!["gantt", "list", "work"].includes(state.tab)) state.tab = "gantt";
+  if (!TABS.includes(state.tab)) state.tab = "gantt";
   for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => switch_tab(b.dataset.tab));
   $("undo_button").addEventListener("click", () => undo_redo("undo"));
   $("redo_button").addEventListener("click", () => undo_redo("redo"));
@@ -713,6 +741,8 @@ function setup() {
   setup_gantt();
   setup_list();
   setup_work();
+  setup_jira();
+  load_jira_config().then(() => render_detail());
   setup_detail();
   reload();
 }

@@ -25,6 +25,12 @@ pub fn router() -> Router<AppState> {
         .route("/work_days", get(list_work_days))
         .route("/work_days/{date}", get(get_work_day).put(save_work_day))
         .route("/settings", get(get_settings).patch(update_settings))
+        .route("/jira", get(get_jira).patch(update_jira))
+        .route("/jira/test", post(test_jira))
+        .route("/jira/issues/{key}", get(get_jira_issue))
+        .route("/jira/draft", get(get_jira_draft))
+        .route("/jira/send", post(send_jira))
+        .route("/about", get(about))
         .route("/undo", post(undo))
         .route("/redo", post(redo))
 }
@@ -88,6 +94,8 @@ fn describe_patch(p: &TaskPatch) -> &'static str {
         "次の予定の変更"
     } else if p.tags.is_some() {
         "タグの変更"
+    } else if p.jira_key.is_some() {
+        "Jira 課題の紐付け"
     } else if p.estimate_min.is_some() {
         "見積もりの変更"
     } else if p.note.is_some() {
@@ -162,10 +170,8 @@ struct AgendaQuery {
 
 async fn get_agenda(State(s): State<AppState>, Query(q): Query<AgendaQuery>) -> ApiResult<Agenda> {
     let today = match q.today.as_deref() {
-        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| {
-            ServiceError::Invalid(format!("日付は YYYY-MM-DD で指定してください: {d}"))
-        })?,
-        None => chrono::Local::now().date_naive(),
+        Some(d) => crate::service::parse_date(d)?,
+        None => crate::service::today(),
     };
     with_conn(&s, |c| agenda_service::agenda(c, today)).map(Json)
 }
@@ -176,7 +182,7 @@ async fn list_tags(State(s): State<AppState>) -> ApiResult<Vec<TagCount>> {
 
 // ---------- 工数 ----------
 #[derive(serde::Deserialize)]
-struct RangeQuery {
+pub struct RangeQuery {
     from: String,
     to: String,
 }
@@ -218,4 +224,119 @@ async fn update_settings(
         })
     })
     .map(Json)
+}
+
+// ---------- Jira ----------
+use crate::jira::{self, DataCenterClient, JiraApi};
+use crate::service::jira_service;
+
+/// Jira とのやり取りの失敗は 502 で、理由をそのまま返す
+fn jira_error(msg: String) -> Response {
+    (StatusCode::BAD_GATEWAY, Json(json!({ "error": msg }))).into_response()
+}
+
+fn jira_client(s: &AppState) -> Result<DataCenterClient, String> {
+    let base = with_conn(s, jira_service::get_config)
+        .map_err(|e| e.0.to_string())?
+        .base_url
+        .ok_or("Jira の URL が設定されていません（Jira タブで設定）")?;
+    let (token, _) = jira::load_token().ok_or("PAT が設定されていません（Jira タブで設定）")?;
+    DataCenterClient::new(&base, &token)
+}
+
+async fn get_jira(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = with_conn(&s, jira_service::get_config)?;
+    let source = jira::load_token().map(|(_, src)| src);
+    Ok(Json(
+        json!({ "base_url": config.base_url, "token_source": source }),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct JiraConfigPatch {
+    base_url: Option<String>,
+    /// 空文字で削除。値は返さない
+    token: Option<String>,
+}
+
+async fn update_jira(State(s): State<AppState>, Json(p): Json<JiraConfigPatch>) -> Response {
+    if let Some(url) = &p.base_url
+        && let Err(e) = with_conn(&s, |c| jira_service::set_base_url(c, url))
+    {
+        return e.into_response();
+    }
+    if let Some(token) = &p.token
+        && let Err(e) = jira::save_token(token)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
+    match get_jira(State(s)).await {
+        Ok(j) => j.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn test_jira(State(s): State<AppState>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    match client.myself().await {
+        Ok(me) => Json(me).into_response(),
+        Err(e) => jira_error(e),
+    }
+}
+
+async fn get_jira_issue(State(s): State<AppState>, Path(key): Path<String>) -> Response {
+    let key = match task_service::normalize_issue_key(Some(key)) {
+        Ok(Some(k)) => k,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return ApiError(e).into_response(),
+    };
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    match client.issue(&key).await {
+        Ok(i) => Json(i).into_response(),
+        Err(e) => jira_error(e),
+    }
+}
+
+async fn get_jira_draft(
+    State(s): State<AppState>,
+    Query(q): Query<RangeQuery>,
+) -> ApiResult<jira_service::Draft> {
+    with_conn(&s, |c| jira_service::build_draft(c, &q.from, &q.to)).map(Json)
+}
+
+async fn send_jira(State(s): State<AppState>, Json(q): Json<RangeQuery>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    match jira::send_draft(&client, &s.conn, &q.from, &q.to).await {
+        Ok(results) => Json(results).into_response(),
+        Err(e) => jira_error(e),
+    }
+}
+
+/// 実行ファイルと DB の場所（ヘルプの MCP 設定例に使う）
+async fn about(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
+        .map(|p| plain_path(&p));
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "exe_path": exe,
+        "db_path": plain_path(&s.db_path),
+        "windows": cfg!(windows),
+    }))
+}
+
+/// Windows の絶対パスに付く \\?\ を外す（設定ファイルに貼りやすいように）
+fn plain_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").map(String::from).unwrap_or(s)
 }

@@ -14,6 +14,8 @@
       <button type="button" class="tab" role="tab" data-tab="gantt">線表</button>
       <button type="button" class="tab" role="tab" data-tab="list">詳細</button>
       <button type="button" class="tab" role="tab" data-tab="work">工数記録</button>
+      <button type="button" class="tab" role="tab" data-tab="jira">Jira</button>
+      <button type="button" class="tab" role="tab" data-tab="help">ヘルプ</button>
     </nav>
     <div class="undo_buttons">
       <button type="button" class="icon_button" id="undo_button" title="元に戻す（Ctrl+Z）">↩️</button>
@@ -47,12 +49,6 @@
             <button id="gfilter_clear" class="small_button" type="button" hidden>解除</button>
           </div>
           <div class="gantt_scroll" id="gantt"></div>
-          <p class="empty_hint gantt_hint">
-            時間軸の上でホイールを回すと表示範囲が前後に動きます（名前欄の上では上下にスクロール）。
-            名前をドラッグで並べ替え・階層変更（行の中央に落とすと子になる）。ダブルクリックで名前を変更。
-            日付のない行は右側を横にドラッグすると期間を決められます。バーはドラッグで移動、端をドラッグで期間を変更。
-            完了したタスクは予定の期間（なければ着手〜完了）を緑で表示します。
-          </p>
         </section>
         <section class="list_section inbox_section">
           <h2 class="section_title" id="inbox_header" title="ここに落とすと未分類へ戻す">未分類
@@ -168,6 +164,43 @@
           </div>
         </section>
       </div>
+
+      <!-- Jira -->
+      <div class="view" id="view_jira" hidden>
+        <section class="list_section jira_section">
+          <h2 class="section_title">接続（社内サーバー版の Jira・PAT）</h2>
+          <div class="jira_form">
+            <label>Jira の URL<input id="jira_url" type="text" placeholder="https://jira.example.co.jp" autocomplete="off"></label>
+            <label>PAT（個人用アクセストークン）<input id="jira_token" type="password" placeholder="新しく入れるときだけ" autocomplete="off"></label>
+            <div class="jira_buttons">
+              <button type="button" class="small_button primary" id="jira_save">保存</button>
+              <button type="button" class="small_button" id="jira_test">接続テスト</button>
+              <button type="button" class="small_button" id="jira_token_delete">PAT を削除</button>
+            </div>
+            <p class="jira_status" id="jira_status"></p>
+          </div>
+        </section>
+        <section class="list_section jira_section">
+          <div class="jira_toolbar">
+            <button type="button" class="small_button" id="jira_prev">◀ 前の週</button>
+            <span class="jira_range" id="jira_range"></span>
+            <button type="button" class="small_button" id="jira_next">次の週 ▶</button>
+            <button type="button" class="small_button" id="jira_this_week">今週</button>
+            <span class="spacer"></span>
+            <button type="button" class="small_button primary" id="jira_send">Jira に送信</button>
+          </div>
+          <div id="jira_draft"></div>
+        </section>
+        <section class="list_section jira_section">
+          <h2 class="section_title">Jira 課題を紐付けたタスク</h2>
+          <div id="jira_links"></div>
+        </section>
+      </div>
+
+      <!-- ヘルプ -->
+      <div class="view" id="view_help" hidden>
+        <section class="list_section help_section" id="help_body"></section>
+      </div>
     </div>
 
     <aside id="detail" class="detail" hidden>
@@ -194,6 +227,10 @@
       <div class="date_pair">
         <label>開始予定日<input id="detail_planned_start" type="date"></label>
         <label>終了予定日<input id="detail_planned_end" type="date"></label>
+      </div>
+      <div class="jira_key_box">
+        <label>Jira 課題<input id="detail_jira_key" type="text" placeholder="例：ABC-123（工数をこの課題に送る）" autocomplete="off"></label>
+        <div class="jira_key_info" id="detail_jira_info"></div>
       </div>
       <div class="effort_box">
         <label>見積もり<input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></label>
@@ -222,6 +259,8 @@
   <script src="/gantt.js"></script>
   <script src="/list.js"></script>
   <script src="/work.js"></script>
+  <script src="/jira.js"></script>
+  <script src="/help.js"></script>
   <script>setup();</script>
 </body>
 </html>

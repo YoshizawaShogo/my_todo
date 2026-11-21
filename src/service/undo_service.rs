@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::ServiceResult;
+use super::{ServiceResult, Tx};
 
 /// 元に戻せる操作の数の上限
 const MAX_STEPS: i64 = 200;
@@ -32,30 +32,30 @@ pub fn record<T>(
     label: &str,
     f: impl FnOnce(&Connection) -> ServiceResult<T>,
 ) -> ServiceResult<T> {
-    let step: i64 = conn.query_row(
+    // 1 回の操作はまるごと成功させるか、まるごと取り消す（途中で失敗したら記録ごと残さない）
+    let tx = Tx::begin(conn)?;
+    let step: i64 = tx.query_row(
         "SELECT COALESCE(MAX(step), 0) + 1 FROM \
          (SELECT step FROM undo_step UNION ALL SELECT step FROM undo_journal)",
         [],
         |r| r.get(0),
     )?;
-    conn.execute(
+    tx.execute(
         "UPDATE undo_state SET mode = 'record', step = ?1 WHERE id = 1",
         [step],
     )?;
-    let result = f(conn);
-    conn.execute(
+    let value = f(&tx)?; // 失敗したら tx を捨てて取り消す
+    tx.execute(
         "UPDATE undo_state SET mode = NULL, step = NULL WHERE id = 1",
         [],
     )?;
-    let value = result?;
 
-    let recorded: bool = conn.query_row(
+    let recorded: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM undo_journal WHERE stack = 'undo' AND step = ?1)",
         [step],
         |r| r.get(0),
     )?;
     if recorded {
-        let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM undo_journal WHERE stack = 'redo'", [])?;
         tx.execute(
             "INSERT OR REPLACE INTO undo_step (step, label) VALUES (?1, ?2)",
@@ -71,8 +71,8 @@ pub fn record<T>(
             "DELETE FROM undo_step WHERE step NOT IN (SELECT step FROM undo_journal)",
             [],
         )?;
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(value)
 }
 
@@ -102,7 +102,7 @@ fn apply(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
         return Ok(None);
     };
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = Tx::begin(conn)?;
     // 打ち消しの途中では親子の順序が前後するので、外部キーの確認はコミット時に行う
     tx.pragma_update(None, "defer_foreign_keys", "ON")?;
     let statements: Vec<String> = {
