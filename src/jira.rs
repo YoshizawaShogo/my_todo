@@ -76,6 +76,8 @@ pub struct IssueInfo {
 pub trait JiraApi {
     async fn myself(&self) -> Result<Myself, String>;
     async fn issue(&self, key: &str) -> Result<IssueInfo, String>;
+    /// JQL で課題を探す（最大 max 件）
+    async fn search(&self, jql: &str, max: usize) -> Result<Vec<IssueInfo>, String>;
     /// 作った worklog の id を返す
     async fn add_worklog(&self, key: &str, work_date: &str, minutes: i64)
     -> Result<String, String>;
@@ -200,6 +202,28 @@ impl JiraApi for DataCenterClient {
             summary: v["fields"]["summary"].as_str().unwrap_or("").into(),
             status: v["fields"]["status"]["name"].as_str().unwrap_or("").into(),
         })
+    }
+
+    async fn search(&self, jql: &str, max: usize) -> Result<Vec<IssueInfo>, String> {
+        let max = max.to_string();
+        let req = self.http.get(self.url("search")).query(&[
+            ("jql", jql),
+            ("fields", "summary,status"),
+            ("maxResults", max.as_str()),
+        ]);
+        let v = self.send(req, "課題の検索").await?;
+        Ok(v["issues"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| IssueInfo {
+                        key: i["key"].as_str().unwrap_or("").into(),
+                        summary: i["fields"]["summary"].as_str().unwrap_or("").into(),
+                        status: i["fields"]["status"]["name"].as_str().unwrap_or("").into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn add_worklog(
@@ -374,6 +398,9 @@ mod tests {
                 summary: "s".into(),
                 status: "Open".into(),
             })
+        }
+        async fn search(&self, _jql: &str, _max: usize) -> Result<Vec<IssueInfo>, String> {
+            Ok(vec![])
         }
         async fn add_worklog(&self, key: &str, d: &str, m: i64) -> Result<String, String> {
             if self.fail_key.as_deref() == Some(key) {

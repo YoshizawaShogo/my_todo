@@ -294,7 +294,7 @@ function effort_cell(t) {
 function list_row(t, today) {
   const done = t.status === "done";
   const row = el("tr", {
-    class: "list_row" + (done ? " done" : "") + (state.selectedId === t.id ? " selected" : ""),
+    class: "list_row" + (done ? " done" : "") + (is_selected(t.id) ? " selected" : ""),
     "data-task_id": t.id,
     onclick: () => select(t.id),
   });
@@ -373,7 +373,10 @@ function render_list_controls(f) {
         render_list();
       },
     }, "×")));
-  $("list_presets").replaceChildren(...presets, ...(saved.length ? [el("span", { class: "toolbar_sep" }), ...saved] : []));
+  $("list_presets").replaceChildren(
+    el("span", { class: "preset_label" }, "プリセット"),
+    ...presets,
+    ...(saved.length ? [el("span", { class: "toolbar_sep" }), el("span", { class: "preset_label" }, "保存した条件"), ...saved] : []));
 
   const text = $("lf_text");
   if (document.activeElement !== text) text.value = f.text;

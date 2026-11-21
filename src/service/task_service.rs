@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::{ServiceError, ServiceResult, Tx, now_text};
 use crate::model::{
-    MoveTarget, NewTask, TagCount, Task, TaskEvent, TaskKind, TaskPatch, TaskStatus,
+    EventKind, MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, TaskPatch, TaskStatus,
 };
 
 const TASK_COLUMNS: &str = "id, parent_id, title, kind, external_job_id, status, is_inbox, \
@@ -10,15 +10,13 @@ const TASK_COLUMNS: &str = "id, parent_id, title, kind, external_job_id, status,
      started_at, next_action, next_action_date";
 
 fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
-    let kind: String = row.get(3)?;
-    let status: String = row.get(5)?;
     Ok(Task {
         id: row.get(0)?,
         parent_id: row.get(1)?,
         title: row.get(2)?,
-        kind: TaskKind::parse(&kind).unwrap_or(TaskKind::Own),
+        kind: row.get(3)?,
         external_job_id: row.get(4)?,
-        status: TaskStatus::parse(&status).unwrap_or(TaskStatus::Todo),
+        status: row.get(5)?,
         is_inbox: row.get(6)?,
         sort_order: row.get(7)?,
         planned_start: row.get(8)?,
@@ -106,12 +104,12 @@ fn record_event(
     conn: &Connection,
     task_id: i64,
     at: &str,
-    kind: &str,
+    kind: EventKind,
     old_value: Option<&str>,
     new_value: Option<&str>,
 ) -> ServiceResult<()> {
-    if kind != "created" {
-        let last: Option<(i64, String, String, Option<String>)> = conn
+    if kind != EventKind::Created {
+        let last: Option<(i64, String, EventKind, Option<String>)> = conn
             .query_row(
                 "SELECT id, at, kind, old_value FROM task_event WHERE task_id = ?1 \
                  ORDER BY at DESC, id DESC LIMIT 1",
@@ -382,7 +380,7 @@ pub fn create_task(conn: &Connection, input: NewTask) -> ServiceResult<Task> {
         ],
     )?;
     let id = tx.last_insert_rowid();
-    record_event(&tx, id, &now, "created", None, Some(&title))?;
+    record_event(&tx, id, &now, EventKind::Created, None, Some(&title))?;
     tx.commit()?;
     get_task(conn, id)
 }
@@ -424,10 +422,14 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
         None => current.next_action_date.clone(),
     };
     let status = patch.status.unwrap_or(current.status);
-    let completed_at = match status {
-        _ if status == current.status => current.completed_at.clone(),
-        TaskStatus::Done => Some(now.clone()),
-        _ => None,
+    // 完了日時：状態が変わらなければそのまま、完了にしたら今、完了以外にしたら消す
+    let completed_at = if status == current.status {
+        current.completed_at.clone()
+    } else {
+        match status {
+            TaskStatus::Done => Some(now.clone()),
+            TaskStatus::Todo | TaskStatus::Doing => None,
+        }
     };
     // 着手日時は初めて作業中にしたときだけ記録し、戻しても消さない
     let started_at = match (&current.started_at, status) {
@@ -460,7 +462,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "tags",
+            EventKind::Tags,
             join(&current.tags).as_deref(),
             join(tags).as_deref(),
         )?;
@@ -472,7 +474,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
         params![
             title,
             note,
-            status.as_str(),
+            status,
             completed_at,
             started_at,
             planned_end,
@@ -487,14 +489,21 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
 
     // いつ何を決めたか・変えたかを自動で残す（メモの変更は記録しない）
     if title != current.title {
-        record_event(&tx, id, &now, "title", Some(&current.title), Some(&title))?;
+        record_event(
+            &tx,
+            id,
+            &now,
+            EventKind::Title,
+            Some(&current.title),
+            Some(&title),
+        )?;
     }
     if status != current.status {
         record_event(
             &tx,
             id,
             &now,
-            "status",
+            EventKind::Status,
             Some(current.status.as_str()),
             Some(status.as_str()),
         )?;
@@ -512,7 +521,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "jira",
+            EventKind::Jira,
             current.jira_key.as_deref(),
             jira_key.as_deref(),
         )?;
@@ -523,7 +532,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "estimate",
+            EventKind::Estimate,
             text(current.estimate_min).as_deref(),
             text(estimate_min).as_deref(),
         )?;
@@ -533,7 +542,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "planned_start",
+            EventKind::PlannedStart,
             current.planned_start.as_deref(),
             planned_start.as_deref(),
         )?;
@@ -543,7 +552,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "planned_end",
+            EventKind::PlannedEnd,
             current.planned_end.as_deref(),
             planned_end.as_deref(),
         )?;
@@ -555,7 +564,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             &tx,
             id,
             &now,
-            "next_action",
+            EventKind::NextAction,
             old_next.as_deref(),
             new_next.as_deref(),
         )?;
@@ -614,6 +623,95 @@ pub fn move_task(conn: &Connection, id: i64, target: MoveTarget) -> ServiceResul
     renumber(&tx, &to_ids)?;
     tx.commit()?;
     get_task(conn, id)
+}
+
+/// 複数のタスクを、並び順を保ったまままとめて移動する。
+/// ids は画面での並び順。ほかの選択されたタスクの子孫は、親と一緒に動くので個別には動かさない
+pub fn move_tasks(
+    conn: &Connection,
+    ids: &[i64],
+    placement: Placement,
+) -> ServiceResult<Vec<Task>> {
+    let tx = Tx::begin(conn)?;
+    // 親子を一緒に選んでいたら親だけ
+    let is_descendant_of_other = |id: i64| -> ServiceResult<bool> {
+        let mut cur = get_task(&tx, id)?.parent_id;
+        while let Some(p) = cur {
+            if ids.contains(&p) {
+                return Ok(true);
+            }
+            cur = get_task(&tx, p)?.parent_id;
+        }
+        Ok(false)
+    };
+    let mut targets = Vec::new();
+    for &id in ids {
+        if !targets.contains(&id) && !is_descendant_of_other(id)? {
+            targets.push(id);
+        }
+    }
+    // 基準のタスクを動かす対象にはできない
+    if let Placement::Before { ref_id } | Placement::After { ref_id } = placement
+        && targets.contains(&ref_id)
+    {
+        return Err(ServiceError::Invalid(
+            "選んだタスクの前後には移動できません".into(),
+        ));
+    }
+
+    // 基準のタスクの兄弟の中での位置（動かすタスク自身は除いて数える）
+    let place_near = |id: i64, ref_id: i64, after: bool| -> ServiceResult<Task> {
+        let r = get_task(&tx, ref_id)?;
+        let siblings: Vec<i64> = Siblings::of(&r)
+            .ids(&tx)?
+            .into_iter()
+            .filter(|&x| x != id)
+            .collect();
+        let pos = siblings
+            .iter()
+            .position(|&x| x == ref_id)
+            .unwrap_or(siblings.len());
+        move_task(
+            &tx,
+            id,
+            MoveTarget {
+                parent_id: r.parent_id,
+                inbox: r.parent_id.is_none() && r.is_inbox,
+                index: Some(if after { pos + 1 } else { pos }),
+            },
+        )
+    };
+    let mut moved = Vec::new();
+    match placement {
+        Placement::Before { ref_id } => {
+            for &id in &targets {
+                moved.push(place_near(id, ref_id, false)?);
+            }
+        }
+        Placement::After { ref_id } => {
+            // 1 件目を基準の後ろに、2 件目以降は直前に動かしたものの後ろに
+            let mut prev = ref_id;
+            for &id in &targets {
+                moved.push(place_near(id, prev, true)?);
+                prev = id;
+            }
+        }
+        Placement::Into { parent_id, inbox } => {
+            for &id in &targets {
+                moved.push(move_task(
+                    &tx,
+                    id,
+                    MoveTarget {
+                        parent_id,
+                        inbox,
+                        index: None,
+                    },
+                )?);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(moved)
 }
 
 /// 子孫もまとめて削除する。
@@ -795,7 +893,7 @@ mod tests {
         let events: Vec<_> = list_events(&conn, a.id)
             .unwrap()
             .into_iter()
-            .map(|e| (e.kind, e.old_value, e.new_value))
+            .map(|e| (e.kind.as_str().to_string(), e.old_value, e.new_value))
             .collect();
         let s = |v: &str| Some(v.to_string());
         assert_eq!(
@@ -893,7 +991,7 @@ mod tests {
 
         let ev = list_events(&conn, a.id).unwrap();
         let last = ev.last().unwrap();
-        assert_eq!(last.kind, "tags");
+        assert_eq!(last.kind, EventKind::Tags);
         assert_eq!(last.new_value.as_deref(), Some("Work"));
     }
 
@@ -916,6 +1014,52 @@ mod tests {
         assert!(matches!(set(r#""12-ABC""#), Err(ServiceError::Invalid(_))));
         assert!(matches!(set(r#""ABC""#), Err(ServiceError::Invalid(_))));
         assert_eq!(set("null").unwrap().jira_key, None);
+    }
+
+    #[test]
+    fn move_many_keeps_order_and_skips_children_of_selected() {
+        let conn = db::open_in_memory().unwrap();
+        let p = add(&conn, "親", None).id;
+        let a = add(&conn, "a", Some(p)).id;
+        let b = add(&conn, "b", Some(p)).id;
+        let c = add(&conn, "c", Some(p)).id;
+        let x = add(&conn, "x", None).id;
+        let x1 = add(&conn, "x1", Some(x)).id;
+        let titles = |s: Siblings| child_titles(&conn, s);
+
+        // b, x（とその子 x1）を c の後ろへ。x1 は x と一緒に動く
+        move_tasks(&conn, &[b, x, x1], Placement::After { ref_id: c }).unwrap();
+        assert_eq!(titles(Siblings::Child(p)), ["a", "c", "b", "x"]);
+        assert_eq!(get_task(&conn, x1).unwrap().parent_id, Some(x));
+
+        // c, x を a の前へ
+        move_tasks(&conn, &[c, x], Placement::Before { ref_id: a }).unwrap();
+        assert_eq!(titles(Siblings::Child(p)), ["c", "x", "a", "b"]);
+
+        // a, b を未分類の末尾へ
+        move_tasks(
+            &conn,
+            &[a, b],
+            Placement::Into {
+                parent_id: None,
+                inbox: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(titles(Siblings::Child(p)), ["c", "x"]);
+        assert_eq!(titles(Siblings::Root { inbox: true }), ["親", "a", "b"]);
+
+        // 自分の子孫の下へは移せず、途中まで動いたものも戻る
+        let err = move_tasks(
+            &conn,
+            &[a, p],
+            Placement::Into {
+                parent_id: Some(x1),
+                inbox: false,
+            },
+        );
+        assert!(err.is_err());
+        assert_eq!(titles(Siblings::Root { inbox: true }), ["親", "a", "b"]);
     }
 
     #[test]
@@ -945,8 +1089,8 @@ mod tests {
 
         // 状態を変えない編集では記録しない（着手日時のない作業中タスク）
         conn.execute(
-            "UPDATE task SET started_at = NULL, status = 'doing' WHERE id = ?1",
-            [a.id],
+            "UPDATE task SET started_at = NULL, status = ?2 WHERE id = ?1",
+            rusqlite::params![a.id, TaskStatus::Doing],
         )
         .unwrap();
         let edited = update_task(

@@ -58,18 +58,30 @@ function toggle_gantt_tag(name) {
   save_gantt_filter();
 }
 
-/// 時間軸の上でホイールを回すと表示範囲を前後に動かす（下・右へ回すと未来へ）。
-/// 名前欄の上では、ふつうに行を上下にスクロールする
+/// 線表の上でのスクロール：普通のホイールは行の上下スクロール（端で止まる。行が少なくて余地がないときはページ全体）。
+/// Shift＋ホイール（とトラックパッドの横スクロール）で表示範囲を前後に動かす（下・右へ回すと未来へ）
 function setup_gantt_wheel() {
   const PX_PER_DAY = 40; // この量のスクロールで 1 日動く
   let acc = 0;
   let frame = 0;
   $("gantt").addEventListener("wheel", (ev) => {
-    if (ev.ctrlKey || ev.target.closest(".gantt_name")) return;
+    if (ev.ctrlKey) return;
     if (document.body.classList.contains("gantt_dragging")) return;
-    ev.preventDefault();
+    const horizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
     const scale = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? 400 : 1; // 行単位・ページ単位のマウスにも対応
-    const delta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    ev.preventDefault();
+    if (!ev.shiftKey && !horizontal) {
+      // 普通のホイールは縦スクロール。ブラウザに任せると、縦に動かせないとき横に動いてしまうので自分で振り分ける。
+      // 線表の中にスクロールする余地があれば、その中だけで動かす（端まで来たら止まり、ページは動かさない）。
+      // 行が少なくて余地がまったくないときだけ、ページ全体を動かす
+      const box = $("gantt");
+      const dy = ev.deltaY * scale;
+      if (box.scrollHeight > box.clientHeight + 1) box.scrollTop += dy;
+      else window.scrollBy(0, dy);
+      return;
+    }
+    // Shift＋ホイールはブラウザによって deltaX にも deltaY にも来る
+    const delta = horizontal ? ev.deltaX : ev.deltaY;
     acc += delta * scale;
     const days = Math.trunc(acc / PX_PER_DAY);
     if (!days) return;
@@ -269,11 +281,11 @@ function inbox_add_row(depth) {
 function inbox_row(t, depth, hasKids) {
   const done = t.status === "done";
   const row = el("div", {
-    class: "inbox_row" + (state.selectedId === t.id ? " selected" : "") + (done ? " done" : "") +
+    class: "inbox_row" + (is_selected(t.id) ? " selected" : "") + (done ? " done" : "") +
       (gantt.matched.has(t.id) ? "" : " dim"),
     "data-task_id": t.id,
     style: `padding-left:${8 + depth * 16}px`,
-    onclick: () => select(t.id),
+    onclick: (ev) => select(t.id, ev),
   });
   const twisty = el("span", {
     class: "twisty" + (hasKids ? "" : " leaf"),
@@ -315,10 +327,10 @@ function gantt_row(r, ctx) {
   const { start, end, today, width, x_of } = ctx;
   const done = t.status === "done";
   const row = el("div", {
-    class: "gantt_row" + (state.selectedId === t.id ? " selected" : "") + (done ? " done" : "") +
+    class: "gantt_row" + (is_selected(t.id) ? " selected" : "") + (done ? " done" : "") +
       (gantt.matched.has(t.id) ? "" : " dim"),
     "data-task_id": t.id,
-    onclick: () => select(t.id),
+    onclick: (ev) => select(t.id, ev),
   });
 
   // 名前欄：開閉・完了チェック・名前・タグ・操作
@@ -367,7 +379,9 @@ function gantt_row(r, ctx) {
   };
 
   const span = span_of(t);
-  const overdue = !done && span.end && span.end < today;
+  const alerts = task_alerts(t, today);
+  const overdue = alerts.overdue;
+  const alertClass = overdue ? " overdue" : alerts.late_start ? " late_start" : "";
   const fromActual = done && !t.planned_end && span.end;
   const tip = [
     t.title,
@@ -378,8 +392,8 @@ function gantt_row(r, ctx) {
   const hasSpan = Boolean(span.start && span.end && span.start <= span.end);
   if (hasSpan) {
     const bar = el("div", {
-      class: `bar own ${t.status}` + (overdue ? " overdue" : ""),
-      title: tip + "\nドラッグで移動、端をドラッグで期間を変更",
+      class: `bar own ${t.status}` + alertClass,
+      title: tip + (overdue ? "\n終了予定日を過ぎています" : alerts.late_start ? "\n開始予定日を過ぎても未着手です" : "") + "\nドラッグで移動、端をドラッグで期間を変更",
     });
     // 表示範囲で切れている側には端のつまみを付けない
     if (span.start >= start) bar.append(el("span", { class: "bar_handle left" }));
@@ -395,10 +409,11 @@ function gantt_row(r, ctx) {
   } else if (span.start) {
     // 終わりが決まっていない：開始から今日まで（未来の開始なら 1 日分）を薄く出す
     const e = !done && today > span.start ? today : span.start;
-    place(el("div", { class: `bar ${t.status} open_end`, title: tip + "\n終了予定日は未設定" }), span.start, e);
+    place(el("div", { class: `bar ${t.status} open_end` + alertClass, title: tip + "\n終了予定日は未設定" + (alerts.late_start ? "\n開始予定日を過ぎています" : "") }), span.start, e);
   }
   if (t.next_action_date && !done) {
-    mark("next", "▶", t.next_action_date, `次の予定 ${short_date(t.next_action_date)}${t.next_action ? " " + t.next_action : ""}`);
+    mark("next" + (alerts.next_overdue ? " overdue" : ""), "▶", t.next_action_date,
+      `次の予定 ${short_date(t.next_action_date)}${t.next_action ? " " + t.next_action : ""}${alerts.next_overdue ? "（過ぎています）" : ""}`);
   }
   if (clipped.left) track.append(el("span", { class: "clip_left", title: "表示範囲より前に予定あり" }, "«"));
   if (clipped.right) track.append(el("span", { class: "clip_right", title: "表示範囲より後に予定あり" }, "»"));

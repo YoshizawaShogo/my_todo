@@ -10,48 +10,38 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskStatus {
-    Todo,
-    Doing,
-    Done,
-}
-
-impl TaskStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TaskStatus::Todo => "todo",
-            TaskStatus::Doing => "doing",
-            TaskStatus::Done => "done",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "todo" => Some(TaskStatus::Todo),
-            "doing" => Some(TaskStatus::Doing),
-            "done" => Some(TaskStatus::Done),
-            _ => None,
-        }
+str_enum! {
+    /// タスクの状態
+    pub enum TaskStatus {
+        /// 未着手
+        Todo => "todo",
+        /// 作業中
+        Doing => "doing",
+        /// 完了
+        Done => "done",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskKind {
-    #[serde(rename = "self")]
-    Own,
-    External,
+str_enum! {
+    /// タスクの種類（自分のタスクか、外部ジョブか。外部ジョブはいまはタグで代用していて未使用）
+    pub enum TaskKind {
+        Own => "self",
+        External => "external",
+    }
 }
 
-impl TaskKind {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "self" => Some(TaskKind::Own),
-            "external" => Some(TaskKind::External),
-            _ => None,
-        }
+str_enum! {
+    /// 変更履歴（task_event）の種類
+    pub enum EventKind {
+        Created => "created",
+        Title => "title",
+        Status => "status",
+        PlannedStart => "planned_start",
+        PlannedEnd => "planned_end",
+        NextAction => "next_action",
+        Tags => "tags",
+        Estimate => "estimate",
+        Jira => "jira",
     }
 }
 
@@ -142,10 +132,26 @@ pub struct TaskEvent {
     pub id: i64,
     pub task_id: i64,
     pub at: String,
-    /// created / title / status / planned_start / planned_end / next_action / tags / estimate / jira
-    pub kind: String,
+    pub kind: EventKind,
     pub old_value: Option<String>,
     pub new_value: Option<String>,
+}
+
+/// まとめて移動するときの置き場所
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Placement {
+    /// ref_id の前に（並びを保って）
+    Before { ref_id: i64 },
+    /// ref_id の後ろに（並びを保って）
+    After { ref_id: i64 },
+    /// 親の子の末尾か、最上位（未分類・タスク）の末尾に
+    Into {
+        #[serde(default)]
+        parent_id: Option<i64>,
+        #[serde(default)]
+        inbox: bool,
+    },
 }
 
 /// 移動先。parent_id が None のときは inbox で未分類かタスク一覧のどちらの最上位かを選ぶ。
@@ -158,4 +164,38 @@ pub struct MoveTarget {
     /// 兄弟の中での位置（0 始まり）。省略または範囲外なら末尾。
     #[serde(default)]
     pub index: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// すべての種類が、文字列 → 読み戻しで同じものに戻る（SQLite と JSON の両方）
+    #[test]
+    fn str_enums_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        for s in TaskStatus::ALL {
+            let back: TaskStatus = conn.query_row("SELECT ?1", [s], |r| r.get(0)).unwrap();
+            assert_eq!(back, *s);
+            let json = serde_json::to_string(s).unwrap();
+            assert_eq!(serde_json::from_str::<TaskStatus>(&json).unwrap(), *s);
+        }
+        for k in EventKind::ALL {
+            assert_eq!(EventKind::parse(k.as_str()), Some(*k));
+        }
+        for k in TaskKind::ALL {
+            assert_eq!(TaskKind::parse(k.as_str()), Some(*k));
+        }
+    }
+
+    /// 知らない値は黙って既定値にせず、エラーにする
+    #[test]
+    fn unknown_values_are_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        let r: rusqlite::Result<EventKind> = conn.query_row("SELECT 'renamed'", [], |r| r.get(0));
+        assert!(r.is_err());
+        let e = serde_json::from_str::<TaskStatus>(r#""finished""#).unwrap_err();
+        assert!(e.to_string().contains("todo / doing / done"), "{e}");
+    }
 }

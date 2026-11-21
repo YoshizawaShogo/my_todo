@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use super::{ServiceError, ServiceResult, now_text, task_service};
+use super::{ServiceError, ServiceResult, SettingKey, now_text, task_service};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JiraConfig {
@@ -19,44 +19,40 @@ pub struct JiraConfig {
 }
 
 pub fn get_config(conn: &Connection) -> ServiceResult<JiraConfig> {
-    let base_url: Option<String> = conn
-        .query_row(
-            "SELECT value FROM setting WHERE key = 'jira_base_url'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
     Ok(JiraConfig {
-        base_url: base_url.filter(|s| !s.is_empty()),
+        base_url: super::get_setting(conn, SettingKey::JiraBaseUrl)?.filter(|s| !s.is_empty()),
     })
 }
 
 pub fn set_base_url(conn: &Connection, url: &str) -> ServiceResult<JiraConfig> {
     let url = url.trim().trim_end_matches('/');
-    if !(url.is_empty() || url.starts_with("https://") || url.starts_with("http://")) {
+    // PAT を平文で流さないよう、http:// はこの PC の中（localhost・127.0.0.1）だけに限る
+    let local_http = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split(['/', ':']).next())
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1"));
+    if !(url.is_empty() || url.starts_with("https://") || local_http) {
         return Err(ServiceError::Invalid(
-            "Jira の URL は https:// から始めてください".into(),
+            "Jira の URL は https:// から始めてください（PAT が暗号化されずに流れるのを防ぐため）"
+                .into(),
         ));
     }
-    conn.execute(
-        "INSERT INTO setting (key, value) VALUES ('jira_base_url', ?1) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [url],
-    )?;
+    super::set_setting(conn, SettingKey::JiraBaseUrl, url)?;
     get_config(conn)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DraftAction {
-    /// まだ送っていない → 新しく作る
-    Create,
-    /// 送った時間と違う → 更新する
-    Update,
-    /// 送ったが今は 0 → 削除する
-    Delete,
-    /// 送った時間と同じ
-    Unchanged,
+str_enum! {
+    /// 下書きの各行で Jira に対して行うこと
+    pub enum DraftAction {
+        /// まだ送っていない → 新しく作る
+        Create => "create",
+        /// 送った時間と違う → 更新する
+        Update => "update",
+        /// 送ったが今は 0 → 削除する
+        Delete => "delete",
+        /// 送った時間と同じ
+        Unchanged => "unchanged",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -350,5 +346,7 @@ mod tests {
         let c = set_base_url(&conn, " https://jira.example.com/ ").unwrap();
         assert_eq!(c.base_url.as_deref(), Some("https://jira.example.com"));
         assert!(set_base_url(&conn, "jira.example.com").is_err());
+        assert!(set_base_url(&conn, "http://jira.example.com").is_err());
+        assert!(set_base_url(&conn, "http://127.0.0.1:8798").is_ok());
     }
 }

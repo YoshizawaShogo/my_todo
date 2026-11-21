@@ -6,7 +6,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::{ServiceError, ServiceResult, Tx, now_text};
+use super::{ServiceError, ServiceResult, SettingKey, Tx, now_text};
+use crate::model::TaskStatus;
 
 /// 振り分けの刻み（分）
 pub const STEP_MIN: i64 = 30;
@@ -32,11 +33,34 @@ pub struct DayEntry {
     pub minutes: i64,
 }
 
+str_enum! {
+    /// time_entry の記録元
+    pub enum EntrySource {
+        /// 1 日の勤務時間を割合で振り分けたもの
+        Daily => "daily",
+        /// タイマー（将来用）
+        Timer => "timer",
+        /// 手入力（将来用）
+        Manual => "manual",
+    }
+}
+
+str_enum! {
+    /// 工数記録の候補に出す理由
+    pub enum SuggestReason {
+        /// その日に記録済み
+        Recorded => "recorded",
+        /// その日に完了した
+        Completed => "completed",
+        /// 線表でその日にバーが重なる
+        Planned => "planned",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Suggestion {
     pub task_id: i64,
-    /// recorded / doing / completed / started / next_action / planned / changed
-    pub reason: String,
+    pub reason: SuggestReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -76,19 +100,16 @@ fn check_date(date: &str) -> ServiceResult<()> {
 }
 
 // ---------- 設定 ----------
-fn setting_i64(conn: &Connection, key: &str, default: i64) -> ServiceResult<i64> {
-    let v: Option<String> = conn
-        .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    Ok(v.and_then(|v| v.parse().ok()).unwrap_or(default))
+fn setting_i64(conn: &Connection, key: SettingKey, default: i64) -> ServiceResult<i64> {
+    Ok(super::get_setting(conn, key)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default))
 }
 
 pub fn get_settings(conn: &Connection) -> ServiceResult<Settings> {
     Ok(Settings {
-        minutes_per_day: setting_i64(conn, "minutes_per_day", 480)?,
-        default_work_min: setting_i64(conn, "default_work_min", 480)?,
+        minutes_per_day: setting_i64(conn, SettingKey::MinutesPerDay, 480)?,
+        default_work_min: setting_i64(conn, SettingKey::DefaultWorkMin, 480)?,
     })
 }
 
@@ -100,11 +121,7 @@ pub fn update_settings(conn: &Connection, patch: SettingsPatch) -> ServiceResult
                 "1D は 1〜24 時間にしてください".into(),
             ));
         }
-        tx.execute(
-            "INSERT INTO setting (key, value) VALUES ('minutes_per_day', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [m.to_string()],
-        )?;
+        super::set_setting(&tx, SettingKey::MinutesPerDay, &m.to_string())?;
     }
     if let Some(m) = patch.default_work_min {
         if !(0..=24 * 60).contains(&m) || m % STEP_MIN != 0 {
@@ -112,11 +129,7 @@ pub fn update_settings(conn: &Connection, patch: SettingsPatch) -> ServiceResult
                 "標準の勤務時間は 0〜24 時間の 0.5 時間刻みにしてください".into(),
             ));
         }
-        tx.execute(
-            "INSERT INTO setting (key, value) VALUES ('default_work_min', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [m.to_string()],
-        )?;
+        super::set_setting(&tx, SettingKey::DefaultWorkMin, &m.to_string())?;
     }
     tx.commit()?;
     get_settings(conn)
@@ -167,9 +180,9 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
     let entries: Vec<DayEntry> = {
         let mut stmt = conn.prepare(
             "SELECT task_id, COALESCE(weight, 0), minutes FROM time_entry \
-             WHERE work_date = ?1 AND source = 'daily' ORDER BY id",
+             WHERE work_date = ?1 AND source = ?2 ORDER BY id",
         )?;
-        stmt.query_map([date], |r| {
+        stmt.query_map(params![date, EntrySource::Daily], |r| {
             Ok(DayEntry {
                 task_id: r.get(0)?,
                 weight: r.get(1)?,
@@ -180,26 +193,43 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
     };
     let allocated_min = entries.iter().map(|e| e.minutes).sum();
 
-    // その日に関わったタスク。理由の優先順に 1 件ずつ
+    // 振り分けの候補：記録済み・その日に完了・線表でその日にバーが重なるもの（理由の優先順に 1 件ずつ）。
+    // バーは線表と同じ考え方：開始は開始予定日（なければ着手日）、終了は終了予定日（完了なら完了日）。
+    // 終了日だけなら ◆ の日、開始だけで未完了なら開始日から今日まで
+    let today = super::today().to_string();
     let mut stmt = conn.prepare(
-        "SELECT task_id, reason FROM ( \
-           SELECT task_id, 'recorded' AS reason, 1 AS p FROM time_entry WHERE work_date = ?1 \
-           UNION ALL SELECT id, 'doing', 2 FROM task WHERE status = 'doing' \
-           UNION ALL SELECT id, 'completed', 3 FROM task WHERE substr(completed_at, 1, 10) = ?1 \
-           UNION ALL SELECT id, 'started', 4 FROM task WHERE substr(started_at, 1, 10) = ?1 \
-           UNION ALL SELECT id, 'next_action', 5 FROM task WHERE next_action_date = ?1 \
-           UNION ALL SELECT id, 'planned', 6 FROM task \
-             WHERE status != 'done' AND planned_start <= ?1 AND planned_end >= ?1 \
-           UNION ALL SELECT DISTINCT task_id, 'changed', 7 FROM task_event WHERE substr(at, 1, 10) = ?1 \
+        "WITH span AS ( \
+           SELECT id, status, \
+             COALESCE(planned_start, substr(started_at, 1, 10)) AS s, \
+             COALESCE(planned_end, CASE WHEN status = ?6 THEN substr(completed_at, 1, 10) END) AS e \
+           FROM task \
+         ) \
+         SELECT task_id, reason FROM ( \
+           SELECT task_id, ?3 AS reason, 1 AS p FROM time_entry WHERE work_date = ?1 \
+           UNION ALL SELECT id, ?4, 2 FROM task WHERE substr(completed_at, 1, 10) = ?1 \
+           UNION ALL SELECT id, ?5, 3 FROM span WHERE \
+             (s IS NOT NULL AND e IS NOT NULL AND s <= ?1 AND e >= ?1) \
+             OR (s IS NULL AND e = ?1) \
+             OR (e IS NULL AND s IS NOT NULL AND status != ?6 AND s <= ?1 AND ?1 <= ?2) \
          ) GROUP BY task_id HAVING p = MIN(p) ORDER BY MIN(p), task_id",
     )?;
     let suggestions = stmt
-        .query_map([date], |r| {
-            Ok(Suggestion {
-                task_id: r.get(0)?,
-                reason: r.get(1)?,
-            })
-        })?
+        .query_map(
+            params![
+                date,
+                today,
+                SuggestReason::Recorded,
+                SuggestReason::Completed,
+                SuggestReason::Planned,
+                TaskStatus::Done
+            ],
+            |r| {
+                Ok(Suggestion {
+                    task_id: r.get(0)?,
+                    reason: r.get(1)?,
+                })
+            },
+        )?
         .collect::<Result<_, _>>()?;
 
     Ok(WorkDay {
@@ -242,8 +272,8 @@ pub fn save_day(conn: &Connection, date: &str, input: SaveDay) -> ServiceResult<
     let now = now_text();
     let tx = Tx::begin(conn)?;
     tx.execute(
-        "DELETE FROM time_entry WHERE work_date = ?1 AND source = 'daily'",
-        [date],
+        "DELETE FROM time_entry WHERE work_date = ?1 AND source = ?2",
+        params![date, EntrySource::Daily],
     )?;
     if input.worked_min == 0 && allocs.is_empty() {
         tx.execute("DELETE FROM work_day WHERE date = ?1", [date])?;
@@ -257,8 +287,8 @@ pub fn save_day(conn: &Connection, date: &str, input: SaveDay) -> ServiceResult<
     for (a, m) in allocs.iter().zip(&minutes) {
         tx.execute(
             "INSERT INTO time_entry (task_id, work_date, minutes, weight, source, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 'daily', ?5)",
-            params![a.task_id, date, m, a.weight, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![a.task_id, date, m, a.weight, EntrySource::Daily, now],
         )?;
     }
     tx.commit()?;
@@ -290,7 +320,7 @@ pub fn list_days(conn: &Connection, from: &str, to: &str) -> ServiceResult<Vec<D
 mod tests {
     use super::*;
     use crate::db;
-    use crate::model::{NewTask, TaskPatch, TaskStatus};
+    use crate::model::{NewTask, TaskPatch};
     use crate::service::{task_service as ts, undo_service};
 
     fn add(conn: &Connection, title: &str) -> i64 {
@@ -408,12 +438,13 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_list_tasks_touched_that_day() {
+    fn suggestions_are_tasks_on_the_gantt_that_day_or_completed() {
         let conn = db::open_in_memory().unwrap();
-        let doing = add(&conn, "作業中");
-        let next = add(&conn, "次の予定");
+        let doing = add(&conn, "作業中（日付なし）");
+        let next = add(&conn, "次の予定だけ");
         let planned = add(&conn, "予定期間");
-        let _other = add(&conn, "関係なし");
+        let end_only = add(&conn, "終了予定日だけ");
+        let outside = add(&conn, "期間外");
         let set = |id, json: &str| {
             let p: TaskPatch = serde_json::from_str(json).unwrap();
             ts::update_task(&conn, id, p).unwrap();
@@ -424,23 +455,28 @@ mod tests {
             planned,
             r#"{"planned_start":"2030-01-08","planned_end":"2030-01-12"}"#,
         );
+        set(end_only, r#"{"planned_end":"2030-01-10"}"#);
+        set(
+            outside,
+            r#"{"planned_start":"2030-01-11","planned_end":"2030-01-12"}"#,
+        );
         let day = get_day(&conn, "2030-01-10").unwrap();
         let s: Vec<_> = day
             .suggestions
             .iter()
             .map(|s| (s.task_id, s.reason.as_str()))
             .collect();
-        assert_eq!(
-            s,
-            [
-                (doing, "doing"),
-                (next, "next_action"),
-                (planned, "planned")
-            ]
-        );
-        assert_eq!(
-            ts::get_task(&conn, doing).unwrap().status,
-            TaskStatus::Doing
+        // 作業中・次の予定だけのもの・期間外は出さない
+        assert_eq!(s, [(planned, "planned"), (end_only, "planned")]);
+
+        // その日に完了したものは出す
+        set(doing, r#"{"status":"done"}"#);
+        let today = crate::service::today().to_string();
+        let day = get_day(&conn, &today).unwrap();
+        assert!(
+            day.suggestions
+                .iter()
+                .any(|s| s.task_id == doing && s.reason == SuggestReason::Completed)
         );
     }
 

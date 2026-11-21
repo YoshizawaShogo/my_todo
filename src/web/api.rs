@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use super::AppState;
-use crate::model::{MoveTarget, NewTask, TagCount, Task, TaskEvent, TaskPatch};
+use crate::model::{MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, TaskPatch};
 use crate::service::agenda_service::{self, Agenda};
 use crate::service::work_service::{self, DaySummary, SaveDay, Settings, SettingsPatch, WorkDay};
 use crate::service::{ServiceError, task_service, undo_service};
@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
             get(get_task).patch(update_task).delete(delete_task),
         )
         .route("/tasks/{id}/move", post(move_task))
+        .route("/tasks/move_many", post(move_tasks))
         .route("/tasks/{id}/events", get(list_events))
         .route("/agenda", get(get_agenda))
         .route("/tags", get(list_tags))
@@ -29,8 +30,13 @@ pub fn router() -> Router<AppState> {
         .route("/jira/test", post(test_jira))
         .route("/jira/issues/{key}", get(get_jira_issue))
         .route("/jira/draft", get(get_jira_draft))
+        .route("/jira/search", get(search_jira))
+        .route("/jira/import", post(import_jira))
         .route("/jira/send", post(send_jira))
         .route("/about", get(about))
+        .route("/databases", get(list_databases))
+        .route("/databases/open", post(open_database))
+        .route("/databases/forget", post(forget_database))
         .route("/undo", post(undo))
         .route("/redo", post(redo))
 }
@@ -311,26 +317,37 @@ async fn get_jira_draft(
 }
 
 async fn send_jira(State(s): State<AppState>, Json(q): Json<RangeQuery>) -> Response {
+    use std::sync::atomic::Ordering;
     let client = match jira_client(&s) {
         Ok(c) => c,
         Err(e) => return jira_error(e),
     };
-    match jira::send_draft(&client, &s.conn, &q.from, &q.to).await {
+    // 送信中の印を立てる（同時に 2 回送らない・送信中は DB を切り替えさせない）
+    if s.jira_sending
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "すでに Jira に送信中です" })),
+        )
+            .into_response();
+    }
+    let result = jira::send_draft(&client, &s.conn, &q.from, &q.to).await;
+    s.jira_sending.store(false, Ordering::SeqCst);
+    match result {
         Ok(results) => Json(results).into_response(),
         Err(e) => jira_error(e),
     }
 }
 
-/// 実行ファイルと DB の場所（ヘルプの MCP 設定例に使う）
+/// アプリの版と開いている DB（起動済みかの確認・新しい版の検知に使う）
 async fn about(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
-        .map(|p| plain_path(&p));
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "exe_path": exe,
-        "db_path": plain_path(&s.db_path),
+        "build": super::BUILD,
+        "build_time": super::build_time_text(),
+        "db_path": plain_path(&current_db(&s)),
         "windows": cfg!(windows),
     }))
 }
@@ -339,4 +356,204 @@ async fn about(State(s): State<AppState>) -> Json<serde_json::Value> {
 fn plain_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     s.strip_prefix(r"\\?\").map(String::from).unwrap_or(s)
+}
+
+// ---------- データベースの切り替え ----------
+use crate::config::{self, Config};
+
+fn current_db(s: &AppState) -> std::path::PathBuf {
+    s.db_path.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[derive(serde::Serialize)]
+struct DbEntry {
+    path: String,
+    name: String,
+    exists: bool,
+    current: bool,
+}
+
+/// 開いているデータベースと、最近開いたデータベースの一覧
+async fn list_databases(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let current = current_db(&s);
+    let entry = |p: &std::path::Path| DbEntry {
+        path: plain_path(p),
+        name: p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        exists: p.is_file(),
+        current: config::normalize(p) == current,
+    };
+    let recent: Vec<DbEntry> = Config::load().recent_dbs.iter().map(|p| entry(p)).collect();
+    Json(json!({ "current": entry(&current), "recent": recent }))
+}
+
+#[derive(serde::Deserialize)]
+struct OpenDb {
+    path: String,
+    /// ファイルがなければ新しく作る
+    #[serde(default)]
+    create: bool,
+}
+
+/// 別のデータベースを開いて切り替える
+async fn open_database(State(s): State<AppState>, Json(req): Json<OpenDb>) -> Response {
+    if s.jira_sending.load(std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "Jira に送信中です。終わってから切り替えてください" })),
+        )
+            .into_response();
+    }
+    let raw = req.path.trim().trim_matches('"');
+    if raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ファイルの場所を入れてください" })),
+        )
+            .into_response();
+    }
+    let mut path = std::path::PathBuf::from(raw);
+    // フォルダを指定されたら、その中の my_todo.db
+    if path.is_dir() {
+        path = path.join("my_todo.db");
+    }
+    if !path.is_file() && !req.create {
+        // 画面側で「新しく作りますか？」と聞けるように、専用の印を付けて返す
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("ファイルがありません: {}", plain_path(&path)), "missing": true, "path": plain_path(&path) })),
+        )
+            .into_response();
+    }
+    if req.create
+        && let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.is_dir()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("フォルダがありません: {}", plain_path(dir)) })),
+        )
+            .into_response();
+    }
+    // 開けるか（SQLite のファイルか、マイグレーションできるか）を確かめてから差し替える
+    let conn = match crate::db::open(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("このファイルは開けません（my_todo のデータベースではないかもしれません）: {e:#}") })),
+            )
+                .into_response();
+        }
+    };
+    let normalized = config::normalize(&path);
+    *s.conn.lock().unwrap_or_else(|e| e.into_inner()) = conn;
+    *s.db_path.lock().unwrap_or_else(|e| e.into_inner()) = normalized.clone();
+    config::remember_db(&normalized);
+    println!(
+        "my_todo: データベースを切り替えました: {}",
+        plain_path(&normalized)
+    );
+    list_databases(State(s)).await.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ForgetDb {
+    path: String,
+}
+
+/// 最近開いたファイルの一覧から外す（ファイル自体は消さない）
+async fn forget_database(
+    State(s): State<AppState>,
+    Json(req): Json<ForgetDb>,
+) -> Json<serde_json::Value> {
+    let mut c = Config::load();
+    c.forget(std::path::Path::new(&req.path));
+    let _ = c.save();
+    list_databases(State(s)).await
+}
+
+#[derive(serde::Deserialize)]
+struct JiraSearchQuery {
+    jql: String,
+}
+
+/// JQL で Jira の課題を探す（紐付けの右側の一覧）
+async fn search_jira(State(s): State<AppState>, Query(q): Query<JiraSearchQuery>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    match client.search(&q.jql, 200).await {
+        Ok(issues) => Json(issues).into_response(),
+        Err(e) => jira_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ImportIssue {
+    key: String,
+    summary: String,
+}
+
+#[derive(serde::Deserialize)]
+struct JiraImport {
+    issues: Vec<ImportIssue>,
+}
+
+/// Jira の課題を、課題キー付きのタスクとして未分類に取り込む（まとめて 1 回の操作）
+async fn import_jira(
+    State(s): State<AppState>,
+    Json(req): Json<JiraImport>,
+) -> ApiResult<Vec<Task>> {
+    let label = format!("Jira から {} 件の取り込み", req.issues.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            let mut out = Vec::new();
+            for i in req.issues {
+                let title = if i.summary.trim().is_empty() {
+                    i.key.clone()
+                } else {
+                    i.summary
+                };
+                let t = task_service::create_task(
+                    c,
+                    NewTask {
+                        title,
+                        parent_id: None,
+                        note: None,
+                        inbox: Some(true),
+                    },
+                )?;
+                let patch = TaskPatch {
+                    jira_key: Some(Some(i.key)),
+                    ..Default::default()
+                };
+                out.push(task_service::update_task(c, t.id, patch)?);
+            }
+            Ok(out)
+        })
+    })
+    .map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct MoveMany {
+    /// 画面での並び順
+    ids: Vec<i64>,
+    placement: Placement,
+}
+
+/// 複数のタスクをまとめて移動する（1 回の操作として元に戻せる）
+async fn move_tasks(State(s): State<AppState>, Json(req): Json<MoveMany>) -> ApiResult<Vec<Task>> {
+    let label = format!("{} 件の移動", req.ids.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            task_service::move_tasks(c, &req.ids, req.placement)
+        })
+    })
+    .map(Json)
 }

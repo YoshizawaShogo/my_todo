@@ -1,3 +1,7 @@
+#[macro_use]
+mod str_enum;
+
+mod config;
 mod db;
 mod jira;
 mod mcp;
@@ -17,8 +21,8 @@ const USAGE: &str = "\
   mcp              MCP サーバーとして標準入出力で待ち受ける（AI から使う）
 
 オプション:
-  --db <PATH>      データベースファイル（既定: 実行ファイルと同じ場所の my_todo.db。
-                   target/ 配下から起動したときはカレントディレクトリ）
+  --db <PATH>      データベースファイル（既定: 前回開いたファイル。初めてなら実行ファイルと
+                   同じ場所の my_todo.db。target/ 配下から起動したときはカレントディレクトリ）
   --port <PORT>    待ち受けポート（既定: 8765。127.0.0.1 のみ）
   --no_open        起動時にブラウザを開かない
   -h, --help       この説明を表示する";
@@ -31,7 +35,8 @@ enum Mode {
 
 struct Options {
     mode: Mode,
-    db_path: PathBuf,
+    /// --db で指定したとき
+    db_path: Option<PathBuf>,
     port: u16,
     open_browser: bool,
 }
@@ -57,7 +62,7 @@ fn is_cargo_target_dir(dir: &std::path::Path) -> bool {
 fn parse_args() -> Result<Option<Options>> {
     let mut opts = Options {
         mode: Mode::Serve,
-        db_path: default_db_path(),
+        db_path: None,
         port: 8765,
         open_browser: true,
     };
@@ -66,7 +71,7 @@ fn parse_args() -> Result<Option<Options>> {
         match arg.as_str() {
             "serve" => opts.mode = Mode::Serve,
             "mcp" => opts.mode = Mode::Mcp,
-            "--db" => opts.db_path = args.next().context("--db に値がありません")?.into(),
+            "--db" => opts.db_path = Some(args.next().context("--db に値がありません")?.into()),
             "--port" => {
                 opts.port = args
                     .next()
@@ -85,21 +90,68 @@ fn parse_args() -> Result<Option<Options>> {
     Ok(Some(opts))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// 開くデータベース：--db の指定 → 前回開いたファイル → 実行ファイルと同じ場所
+fn resolve_db_path(opts: &Options) -> PathBuf {
+    opts.db_path
+        .clone()
+        .or_else(|| config::Config::load().last_db())
+        .unwrap_or_else(default_db_path)
+}
+
+fn main() {
+    // ダブルクリックで起動したとき、エラーや異常終了のメッセージが読めるように窓を閉じずに待つ
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        // 要求ごとの処理（tokio のワーカー）の panic はアプリが続くので待たない。
+        // 待つのはアプリ自体が終わる main スレッドの panic だけ
+        if std::thread::current().name() == Some("main") {
+            pause_if_own_console();
+        }
+    }));
+    let result = tokio::runtime::Runtime::new()
+        .context("非同期処理の準備ができません")
+        .and_then(|rt| rt.block_on(run()));
+    if let Err(e) = result {
+        eprintln!("my_todo: エラー: {e:#}");
+        pause_if_own_console();
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let Some(opts) = parse_args()? else {
         return Ok(());
     };
-    let conn = db::open(&opts.db_path)?;
+    let db_path = resolve_db_path(&opts);
+    let conn = db::open(&db_path)?;
+    config::remember_db(&db_path);
     match opts.mode {
         // 標準出力は JSON-RPC 専用なので、案内は標準エラーへ
         Mode::Mcp => {
-            eprintln!("my_todo mcp: データベース {}", opts.db_path.display());
+            eprintln!("my_todo mcp: データベース {}", db_path.display());
             tokio::task::block_in_place(|| mcp::run(&conn))
         }
         Mode::Serve => {
-            println!("my_todo: データベース {}", opts.db_path.display());
-            web::serve(conn, opts.db_path, opts.port, opts.open_browser).await
+            println!("my_todo: データベース {}", db_path.display());
+            web::serve(conn, db_path, opts.port, opts.open_browser).await
         }
     }
 }
+
+/// この窓（コンソール）を使っているのが自分だけ＝ダブルクリックで起動したときは、
+/// 閉じる前に Enter を待つ。コマンドプロンプトなどから起動したときは待たない
+#[cfg(windows)]
+#[allow(unsafe_code)] // Windows の API（GetConsoleProcessList）を呼ぶため。引数は長さを合わせた配列だけ
+fn pause_if_own_console() {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut pids = [0u32; 2];
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    if count == 1 {
+        eprintln!("\nEnter キーを押すと閉じます。");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+#[cfg(not(windows))]
+fn pause_if_own_console() {}

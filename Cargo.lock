@@ -1237,6 +1237,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1608,6 +1609,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

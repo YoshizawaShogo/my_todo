@@ -11,17 +11,32 @@ use super::{ServiceResult, Tx};
 /// 元に戻せる操作の数の上限
 const MAX_STEPS: i64 = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stack {
-    Undo,
-    Redo,
+str_enum! {
+    /// undo_journal のどちらの山か（マイグレーション 004 のトリガーの 'undo' / 'redo' と同じ文字列）
+    enum Stack {
+        Undo => "undo",
+        Redo => "redo",
+    }
+}
+
+str_enum! {
+    /// undo_state.mode：いま何をしているか（トリガーはこれを見て記録先を決める）
+    enum UndoMode {
+        /// 通常の操作（打ち消し SQL を undo の山へ）
+        Record => "record",
+        /// 元に戻している（打ち消し SQL を redo の山へ）
+        Undo => "undo",
+        /// やり直している（打ち消し SQL を undo の山へ）
+        Redo => "redo",
+    }
 }
 
 impl Stack {
-    fn as_str(self) -> &'static str {
+    /// この山から取り出して実行している間のモード
+    fn applying_mode(self) -> UndoMode {
         match self {
-            Stack::Undo => "undo",
-            Stack::Redo => "redo",
+            Stack::Undo => UndoMode::Undo,
+            Stack::Redo => UndoMode::Redo,
         }
     }
 }
@@ -41,8 +56,8 @@ pub fn record<T>(
         |r| r.get(0),
     )?;
     tx.execute(
-        "UPDATE undo_state SET mode = 'record', step = ?1 WHERE id = 1",
-        [step],
+        "UPDATE undo_state SET mode = ?1, step = ?2 WHERE id = 1",
+        params![UndoMode::Record, step],
     )?;
     let value = f(&tx)?; // 失敗したら tx を捨てて取り消す
     tx.execute(
@@ -51,21 +66,21 @@ pub fn record<T>(
     )?;
 
     let recorded: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM undo_journal WHERE stack = 'undo' AND step = ?1)",
-        [step],
+        "SELECT EXISTS(SELECT 1 FROM undo_journal WHERE stack = ?1 AND step = ?2)",
+        params![Stack::Undo, step],
         |r| r.get(0),
     )?;
     if recorded {
-        tx.execute("DELETE FROM undo_journal WHERE stack = 'redo'", [])?;
+        tx.execute("DELETE FROM undo_journal WHERE stack = ?1", [Stack::Redo])?;
         tx.execute(
             "INSERT OR REPLACE INTO undo_step (step, label) VALUES (?1, ?2)",
             params![step, label],
         )?;
         // 古いステップを捨てる
         tx.execute(
-            "DELETE FROM undo_journal WHERE stack = 'undo' AND step <= \
-             (SELECT step FROM undo_step ORDER BY step DESC LIMIT 1 OFFSET ?1)",
-            [MAX_STEPS],
+            "DELETE FROM undo_journal WHERE stack = ?1 AND step <= \
+             (SELECT step FROM undo_step ORDER BY step DESC LIMIT 1 OFFSET ?2)",
+            params![Stack::Undo, MAX_STEPS],
         )?;
         tx.execute(
             "DELETE FROM undo_step WHERE step NOT IN (SELECT step FROM undo_journal)",
@@ -88,13 +103,16 @@ pub fn redo(conn: &Connection) -> ServiceResult<Option<String>> {
 
 fn apply(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
     // 元に戻すのは一番新しいステップ、やり直すのは一番最近に戻したステップ
-    let order = if from == Stack::Undo { "DESC" } else { "ASC" };
+    let order = match from {
+        Stack::Undo => "DESC",
+        Stack::Redo => "ASC",
+    };
     let step: Option<i64> = conn
         .query_row(
             &format!(
                 "SELECT step FROM undo_journal WHERE stack = ?1 ORDER BY step {order} LIMIT 1"
             ),
-            [from.as_str()],
+            [from],
             |r| r.get(0),
         )
         .optional()?;
@@ -109,17 +127,17 @@ fn apply(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
         let mut stmt = tx.prepare(
             "SELECT sql FROM undo_journal WHERE stack = ?1 AND step = ?2 ORDER BY seq DESC",
         )?;
-        stmt.query_map(params![from.as_str(), step], |r| r.get(0))?
+        stmt.query_map(params![from, step], |r| r.get(0))?
             .collect::<Result<_, _>>()?
     };
     tx.execute(
         "DELETE FROM undo_journal WHERE stack = ?1 AND step = ?2",
-        params![from.as_str(), step],
+        params![from, step],
     )?;
     // 実行中の変更は反対側の履歴に記録される（undo 中 → redo へ、redo 中 → undo へ）
     tx.execute(
         "UPDATE undo_state SET mode = ?1, step = ?2 WHERE id = 1",
-        params![from.as_str(), step],
+        params![from.applying_mode(), step],
     )?;
     for sql in &statements {
         tx.execute_batch(sql)?;
@@ -246,6 +264,44 @@ mod tests {
             .map(|t| t.title)
             .collect();
         assert_eq!(titles, ["b"]);
+    }
+
+    /// 画面と MCP のように、別々の接続が同じファイルに同時に書いても失敗しない
+    #[test]
+    fn concurrent_writers_on_same_file_do_not_fail() {
+        let path =
+            std::env::temp_dir().join(format!("my_todo_concurrency_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let setup = db::open(&path).unwrap();
+        let a = add(&setup, "a", None);
+        drop(setup);
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let conn = db::open(&path).unwrap();
+                    for i in 0..50 {
+                        let patch = TaskPatch {
+                            title: Some(format!("w{w}-{i}")),
+                            ..Default::default()
+                        };
+                        record(&conn, "変更", |c| ts::update_task(c, a.id, patch)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("書き込みが失敗した");
+        }
+        let conn = db::open(&path).unwrap();
+        let steps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM undo_step", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(steps, 101); // 追加 1 + 変更 100
+        drop(conn);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     #[test]

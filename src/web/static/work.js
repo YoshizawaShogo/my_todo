@@ -187,7 +187,7 @@ function work_row(r, minutes, total) {
   num.addEventListener("change", () => apply(num.value, true));
 
   const path = path_titles(t);
-  return el("div", { class: "work_row" + (r.weight > 0 ? "" : " zero") + (state.selectedId === t.id ? " selected" : ""), "data-task_id": t.id },
+  return el("div", { class: "work_row" + (r.weight > 0 ? "" : " zero") + (is_selected(t.id) ? " selected" : ""), "data-task_id": t.id },
     el("div", { class: "work_name", onclick: () => select(t.id), title: "クリックで右に詳細" },
       el("span", { class: "title" + (t.status === "done" ? " done" : "") }, t.title),
       el("span", { class: "crumb" }, path.join(" › ")),

@@ -17,6 +17,16 @@
       <button type="button" class="tab" role="tab" data-tab="jira">Jira</button>
       <button type="button" class="tab" role="tab" data-tab="help">ヘルプ</button>
     </nav>
+    <div class="alerts">
+      <span class="conn_alert" id="conn_alert" hidden title="画面の操作は保存されません">⚠ アプリと通信できません。my_todo を起動し直してください</span>
+      <button type="button" class="outdated_alert" id="outdated_alert" hidden title="クリックで再読み込み">↻ 新しい版があります。再読み込みしてください</button>
+      <button type="button" class="alert_button" id="alert_button" hidden></button>
+      <div class="alert_panel" id="alert_panel" hidden></div>
+    </div>
+    <div class="db_switch">
+      <button type="button" class="db_button" id="db_button" title="開いているデータベース（クリックで切り替え）"></button>
+      <div class="db_panel" id="db_panel" hidden></div>
+    </div>
     <div class="undo_buttons">
       <button type="button" class="icon_button" id="undo_button" title="元に戻す（Ctrl+Z）">↩️</button>
       <button type="button" class="icon_button" id="redo_button" title="やり直し（Ctrl+Y）">↪️</button>
@@ -40,6 +50,8 @@
               <span class="legend_bar summary"></span>子の範囲
               <span class="legend_mark">◆</span>終了日のみ
               <span class="legend_mark next">▶</span>次の予定
+              <span class="legend_bar frame overdue"></span>期限切れ
+              <span class="legend_bar frame late_start"></span>開始遅れ
             </span>
           </div>
           <div class="gantt_filter">
@@ -168,9 +180,9 @@
       <!-- Jira -->
       <div class="view" id="view_jira" hidden>
         <section class="list_section jira_section">
-          <h2 class="section_title">接続（社内サーバー版の Jira・PAT）</h2>
+          <h2 class="section_title">接続</h2>
           <div class="jira_form">
-            <label>Jira の URL<input id="jira_url" type="text" placeholder="https://jira.example.co.jp" autocomplete="off"></label>
+            <label>Jira の URL<input id="jira_url" type="text" placeholder="https://jira.example.com" autocomplete="off"></label>
             <label>PAT（個人用アクセストークン）<input id="jira_token" type="password" placeholder="新しく入れるときだけ" autocomplete="off"></label>
             <div class="jira_buttons">
               <button type="button" class="small_button primary" id="jira_save">保存</button>
@@ -180,20 +192,34 @@
             <p class="jira_status" id="jira_status"></p>
           </div>
         </section>
+
+        <section class="list_section jira_section">
+          <h2 class="section_title">紐付けとインポート</h2>
+          <div class="jira_toolbar">
+            <input id="jira_jql" class="filter_text wide" type="text" autocomplete="off"
+              title="Jira の検索条件（JQL）。既定は自分が担当の未解決の課題">
+            <button type="button" class="small_button primary" id="jira_fetch">Jira から取得</button>
+          </div>
+          <p class="empty_hint">右の Jira の課題を、左のタスクにドラッグすると紐付きます（左でタスクを選んでから「← 紐付け」でも可）。対応するタスクがない課題は「取り込む」でタスクとして作れます。</p>
+          <div class="jira_match">
+            <div class="jira_col">
+              <h3>このアプリのタスク</h3>
+              <div id="jira_tasks" class="jira_list"></div>
+            </div>
+            <div class="jira_col">
+              <h3>Jira の課題 <button type="button" class="small_button" id="jira_import_all" hidden>未紐付けをすべて取り込む</button></h3>
+              <div id="jira_issues" class="jira_list"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="list_section jira_section">
           <div class="jira_toolbar">
-            <button type="button" class="small_button" id="jira_prev">◀ 前の週</button>
-            <span class="jira_range" id="jira_range"></span>
-            <button type="button" class="small_button" id="jira_next">次の週 ▶</button>
-            <button type="button" class="small_button" id="jira_this_week">今週</button>
+            <h2 class="section_title flat">エクスポート（工数を Jira に送る）</h2>
             <span class="spacer"></span>
             <button type="button" class="small_button primary" id="jira_send">Jira に送信</button>
           </div>
           <div id="jira_draft"></div>
-        </section>
-        <section class="list_section jira_section">
-          <h2 class="section_title">Jira 課題を紐付けたタスク</h2>
-          <div id="jira_links"></div>
         </section>
       </div>
 
@@ -261,6 +287,8 @@
   <script src="/work.js"></script>
   <script src="/jira.js"></script>
   <script src="/help.js"></script>
+  <script src="/database.js"></script>
+  <script src="/alerts.js"></script>
   <script>setup();</script>
 </body>
 </html>

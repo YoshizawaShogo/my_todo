@@ -9,7 +9,10 @@ const state = {
   children: new Map(), // parent_id / "root" / "inbox" -> [task]（sort_order 順）
   tags: [], // [{name, count}]
   settings: null, // {minutes_per_day, default_work_min}
-  selectedId: null,
+  selectedId: null, // 詳細パネルに出すタスク（最後にクリックしたもの）
+  selected: new Set(), // 選んでいるタスク（Shift・Ctrl＋クリックで複数）
+  anchorId: null, // Shift＋クリックの範囲の起点
+  dragIds: null, // ドラッグ中のタスク（複数選択ならすべて、画面の並び順）
   tab: load_json("tab", "gantt"), // gantt / list
   collapsed: new Set(load_json("collapsed", [])),
   dragId: null,
@@ -36,11 +39,20 @@ const $ = (id) => document.getElementById(id);
 
 // ---------- API ----------
 async function api(method, path, body) {
-  const res = await fetch("/api" + path, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch("/api" + path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    // アプリ（my_todo.exe）が止まっている
+    set_offline(true);
+    toast("アプリと通信できません。my_todo を起動し直してください", "error");
+    throw e;
+  }
+  set_offline(false, { reload: false });
   if (!res.ok) {
     let msg = res.statusText;
     try {
@@ -78,7 +90,9 @@ async function reload() {
     state.children.get(key).push(t);
   }
   for (const list of state.children.values()) list.sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+  refresh_unrecorded().catch(() => {});
   if (state.selectedId !== null && !state.byId.has(state.selectedId)) state.selectedId = null;
+  state.selected = new Set([...state.selected].filter((id) => state.byId.has(id)));
   render();
 }
 
@@ -191,6 +205,7 @@ async function remove(id) {
   if (!confirm(msg)) return;
   await api("DELETE", `/tasks/${id}`);
   if (state.selectedId === id) state.selectedId = null;
+  state.selected.delete(id);
   await reload();
   toast(`🗑️「${task.title}」を削除しました（Ctrl+Z で元に戻す）`);
 }
@@ -351,6 +366,20 @@ function fmt(s) {
 
 const STATUS_LABEL = { todo: "未着手", doing: "作業中", done: "完了" };
 
+/// タスクの異常（線表の枠の色と、ヘッダーの「⚠」の一覧で使う）
+/// - overdue：終了予定日を過ぎたのに完了していない
+/// - late_start：開始予定日を過ぎたのに未着手（期限切れのときは期限切れを優先）
+/// - next_overdue：次の予定の日を過ぎた（未完了）
+function task_alerts(t, today = today_text()) {
+  if (t.status === "done") return { overdue: false, late_start: false, next_overdue: false };
+  const overdue = Boolean(t.planned_end && t.planned_end < today);
+  return {
+    overdue,
+    late_start: !overdue && t.status === "todo" && Boolean(t.planned_start && t.planned_start < today),
+    next_overdue: Boolean(t.next_action_date && t.next_action_date < today),
+  };
+}
+
 // ---------- タブ ----------
 function render() {
   for (const b of document.querySelectorAll(".tab")) {
@@ -359,6 +388,7 @@ function render() {
     b.setAttribute("aria-selected", active);
   }
   for (const name of TABS) $("view_" + name).hidden = state.tab !== name;
+  render_alerts();
   if (state.tab === "gantt") render_gantt();
   else if (state.tab === "list") render_list();
   else if (state.tab === "work") render_work();
@@ -440,20 +470,44 @@ function clear_drop_marks() {
     e.classList.remove("drop_before", "drop_after", "drop_into"));
 }
 
+/// ドラッグしているタスク（のどれか）の上や子孫の上には落とせない
+function dragging_onto_self(targetId) {
+  return (state.dragIds || [state.dragId]).some((id) => is_self_or_descendant(id, targetId));
+}
+
+/// 複数のタスクをまとめて移動する（1 回の操作として元に戻せる）
+async function move_many(ids, placement) {
+  await api("POST", "/tasks/move_many", { ids, placement });
+  await reload();
+  toast(`${ids.length} 件を移動しました（Ctrl+Z で元に戻す）`);
+}
+
 /// handle をつかんでドラッグし、rowEl の上に落とすと前後・子に移す
 function attach_tree_drag(handle, rowEl, task) {
   handle.draggable = true;
   handle.addEventListener("dragstart", (ev) => {
+    // 選んでいる行をつかんだら、選んでいるものをすべて（画面の並び順で）動かす
+    const ids = is_selected(task.id) && state.selected.size > 1
+      ? visible_task_order().filter((id) => state.selected.has(id))
+      : [task.id];
     state.dragId = task.id;
+    state.dragIds = ids;
     ev.dataTransfer.effectAllowed = "move";
-    ev.dataTransfer.setData("text/plain", String(task.id));
+    ev.dataTransfer.setData("text/plain", ids.join(","));
+    if (ids.length > 1) {
+      const ghost = el("div", { class: "drag_ghost" }, `${ids.length} 件を移動`);
+      document.body.append(ghost);
+      ev.dataTransfer.setDragImage(ghost, 10, 10);
+      setTimeout(() => ghost.remove(), 0);
+    }
   });
   handle.addEventListener("dragend", () => {
     state.dragId = null;
+    state.dragIds = null;
     clear_drop_marks();
   });
   rowEl.addEventListener("dragover", (ev) => {
-    if (state.dragId === null || is_self_or_descendant(state.dragId, task.id)) return;
+    if (state.dragId === null || dragging_onto_self(task.id)) return;
     ev.preventDefault();
     clear_drop_marks();
     rowEl.classList.add("drop_" + drop_zone(rowEl, ev));
@@ -462,10 +516,14 @@ function attach_tree_drag(handle, rowEl, task) {
   rowEl.addEventListener("drop", async (ev) => {
     ev.preventDefault();
     const id = state.dragId;
+    const ids = state.dragIds || [id];
     clear_drop_marks();
-    if (id === null || is_self_or_descendant(id, task.id)) return;
+    if (id === null || dragging_onto_self(task.id)) return;
     const zone = drop_zone(rowEl, ev);
-    if (zone === "into") {
+    if (ids.length > 1) {
+      if (zone === "into") expand(task.id);
+      await move_many(ids, zone === "into" ? { kind: "into", parent_id: task.id, inbox: false } : { kind: zone, ref_id: task.id });
+    } else if (zone === "into") {
       expand(task.id);
       await move(id, task.id, null);
     } else {
@@ -486,17 +544,55 @@ function attach_group_drop(rowEl, key) {
   rowEl.addEventListener("drop", async (ev) => {
     ev.preventDefault();
     clear_drop_marks();
-    if (state.dragId !== null) await move(state.dragId, key, null);
+    if (state.dragId === null) return;
+    const ids = state.dragIds || [state.dragId];
+    if (ids.length > 1) await move_many(ids, { kind: "into", parent_id: null, inbox: key === "inbox" });
+    else await move(state.dragId, key, null);
   });
 }
 
 // ---------- 詳細パネル ----------
-function select(id) {
-  state.selectedId = id;
-  // 表は作り直さない（ダブルクリックやドラッグを妨げないため）
-  document.querySelectorAll(".selected").forEach((r) => r.classList.remove("selected"));
-  if (id !== null) document.querySelectorAll(`[data-task_id="${id}"]`).forEach((r) => r.classList.add("selected"));
+/// タスクを選ぶ。クリックで 1 件、Shift＋クリックで範囲、Ctrl（Mac は ⌘）＋クリックで足す・外す
+function select(id, ev) {
+  if (id === null) {
+    state.selected = new Set();
+    state.selectedId = null;
+    state.anchorId = null;
+  } else if (ev?.shiftKey && state.anchorId !== null) {
+    const order = visible_task_order();
+    const a = order.indexOf(state.anchorId), b = order.indexOf(id);
+    state.selected = a >= 0 && b >= 0 ? new Set(order.slice(Math.min(a, b), Math.max(a, b) + 1)) : new Set([id]);
+    state.selectedId = id;
+  } else if (ev && (ev.ctrlKey || ev.metaKey)) {
+    if (state.selected.has(id)) state.selected.delete(id);
+    else state.selected.add(id);
+    state.selectedId = state.selected.has(id) ? id : ([...state.selected].pop() ?? null);
+    state.anchorId = id;
+  } else {
+    state.selected = new Set([id]);
+    state.selectedId = id;
+    state.anchorId = id;
+  }
+  apply_selection_classes();
   render_detail();
+}
+
+function is_selected(id) {
+  return state.selected.has(id);
+}
+
+/// 今のタブで見えているタスクの並び順（線表 → 未分類のように画面の上から）
+function visible_task_order() {
+  const ids = [...document.querySelectorAll(`#view_${state.tab} [data-task_id]`)].map((e) => Number(e.dataset.task_id));
+  return ids.filter((v, i) => ids.indexOf(v) === i);
+}
+
+/// 表は作り直さずに、選択の見た目だけ変える（ダブルクリックやドラッグを妨げないため）
+function apply_selection_classes() {
+  document.querySelectorAll("[data-task_id].selected").forEach((r) => r.classList.remove("selected"));
+  for (const id of state.selected) {
+    document.querySelectorAll(`[data-task_id="${id}"]`).forEach((r) => r.classList.add("selected"));
+  }
 }
 
 let renderedDetailId = null;
@@ -505,6 +601,7 @@ let historyKey = null; // 履歴を取り直すかの判定用（id と再読み
 function render_detail() {
   const panel = $("detail");
   const task = state.selectedId === null ? null : state.byId.get(state.selectedId);
+  panel.querySelector(".detail_header h2").textContent = state.selected.size > 1 ? `詳細（${state.selected.size} 件選択中）` : "詳細";
   panel.hidden = !task;
   if (!task) {
     renderedDetailId = null;
@@ -540,7 +637,7 @@ function render_detail() {
     parts.push(`見積もり ${fmt_effort(task.estimate_min)}`);
     if (actual) parts.push(`消化 ${Math.round((actual / task.estimate_min) * 100)}%`);
   }
-  $("detail_actual").textContent = parts.join(" ／ ") || "まだ工数の記録はありません（工数タブで振り分け）";
+  $("detail_actual").textContent = parts.join(" ／ ") || "まだ工数の記録はありません（工数記録タブで振り分け）";
   $("detail_actual").classList.toggle("over", Boolean(task.estimate_min && actual > task.estimate_min));
   $("detail_tags").replaceChildren(...task.tags.map((name) => el("span", { class: "tag_chip", style: tag_style(name) },
     name,
@@ -742,6 +839,8 @@ function setup() {
   setup_list();
   setup_work();
   setup_jira();
+  setup_databases();
+  setup_alerts();
   load_jira_config().then(() => render_detail());
   setup_detail();
   reload();

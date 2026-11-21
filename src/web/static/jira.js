@@ -1,13 +1,22 @@
 "use strict";
-// Jira タブ。接続の設定、週ごとの送信（下書き → 送信）、紐付けたタスクの一覧。
+// Jira タブ。接続の設定、紐付けとインポート（左にこのアプリのタスク、右に Jira の課題）、
+// エクスポート（まだ送っていない工数をまとめて送る）。このアプリがマスターで、Jira からは課題を取り込むだけ。
+
+const JIRA_DEFAULT_JQL = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC";
+// エクスポートは期間を区切らず、まだ送っていない分をすべて送る
+const JIRA_ALL_FROM = "1970-01-01";
+const JIRA_ALL_TO = "9999-12-31";
 
 const jira = {
   config: null, // {base_url, token_source}
-  week: monday_of(today_text()),
+  jql: load_json("jira_jql", JIRA_DEFAULT_JQL),
+  issues: null, // Jira から取った課題 [{key, summary, status}]
+  issuesError: null,
+  pickedTaskId: null, // 左で選んだタスク（「← 紐付け」の相手）
   draft: null,
   draftKey: null,
   results: null, // 直前の送信結果
-  issues: new Map(), // 課題キー → {summary, status} または {error}
+  testResult: "",
 };
 
 const JIRA_ACTION = { create: "新規", update: "更新", delete: "削除", unchanged: "送信済み" };
@@ -25,7 +34,7 @@ function jira_browse_url(key) {
 function jira_key_link(key) {
   const url = jira_browse_url(key);
   return url
-    ? el("a", { href: url, target: "_blank", rel: "noopener", class: "jira_key", title: "Jira で開く" }, key)
+    ? el("a", { href: url, target: "_blank", rel: "noopener", class: "jira_key", title: "Jira で開く", onclick: (ev) => ev.stopPropagation() }, key)
     : el("span", { class: "jira_key" }, key);
 }
 
@@ -35,6 +44,22 @@ function render_jira() {
     load_jira_config().then(render_jira);
     return;
   }
+  draw_jira_connection();
+  draw_jira_match();
+  const key = `all@${reloadCount}`;
+  if (jira.draftKey !== key) {
+    jira.draftKey = key;
+    api("GET", `/jira/draft?from=${JIRA_ALL_FROM}&to=${JIRA_ALL_TO}`).then((d) => {
+      if (jira.draftKey !== key) return;
+      jira.draft = d;
+      draw_jira_draft();
+    });
+  } else {
+    draw_jira_draft();
+  }
+}
+
+function draw_jira_connection() {
   const c = jira.config;
   const url = $("jira_url");
   if (document.activeElement !== url) url.value = c.base_url || "";
@@ -44,25 +69,144 @@ function render_jira() {
   $("jira_status").replaceChildren(
     el("span", { class: "jira_badge " + (c.base_url ? "ok" : "ng") }, c.base_url ? "URL 設定済み" : "URL 未設定"),
     el("span", { class: "jira_badge " + (c.token_source ? "ok" : "ng") }, `PAT：${src}`),
-    el("span", { id: "jira_test_result" }, jira.testResult || ""));
+    el("span", {}, jira.testResult || ""));
   $("jira_token_delete").hidden = c.token_source !== "keyring";
-
-  const from = jira.week, to = add_days(jira.week, 6);
-  $("jira_range").textContent = `${short_date(from)} 〜 ${short_date(to)}`;
-  const key = `${from}@${reloadCount}`;
-  if (jira.draftKey !== key) {
-    jira.draftKey = key;
-    api("GET", `/jira/draft?from=${from}&to=${to}`).then((d) => {
-      if (jira.draftKey !== key) return;
-      jira.draft = d;
-      draw_jira_draft();
-    });
-  } else {
-    draw_jira_draft();
-  }
-  draw_jira_links();
+  const jql = $("jira_jql");
+  if (document.activeElement !== jql) jql.value = jira.jql;
 }
 
+// ---------- 紐付けとインポート ----------
+function draw_jira_match() {
+  draw_jira_tasks();
+  draw_jira_issues();
+}
+
+/// 左：このアプリのタスク（木のまま。完了したものは紐付いているときだけ出す）
+function draw_jira_tasks() {
+  const rows = [];
+  const walk = (t, depth) => {
+    const visible = t.status !== "done" || t.jira_key || children_of(t.id).some((c) => c.status !== "done");
+    if (!visible) return;
+    rows.push(jira_task_row(t, depth));
+    children_of(t.id).forEach((c) => walk(c, depth + 1));
+  };
+  const roots = [...children_of("root"), ...children_of("inbox")];
+  roots.forEach((t) => walk(t, 0));
+  $("jira_tasks").replaceChildren(...(rows.length ? rows : [el("p", { class: "empty_hint" }, "タスクがありません")]));
+}
+
+function jira_task_row(t, depth) {
+  const row = el("div", {
+    class: "jira_task" + (jira.pickedTaskId === t.id ? " picked" : "") + (t.status === "done" ? " done" : ""),
+    style: `padding-left:${8 + depth * 16}px`,
+    title: "クリックで選ぶ（右の「← 紐付け」の相手になる）。右の課題をここにドラッグしても紐付く",
+    onclick: () => {
+      jira.pickedTaskId = jira.pickedTaskId === t.id ? null : t.id;
+      draw_jira_match();
+    },
+  }, el("span", { class: "title" }, t.title));
+  if (t.jira_key) {
+    row.append(el("span", { class: "jira_link_chip" },
+      jira_key_link(t.jira_key),
+      el("button", {
+        type: "button",
+        class: "remove",
+        title: "紐付けを外す",
+        onclick: (ev) => { ev.stopPropagation(); link_issue(t.id, null); },
+      }, "×")));
+  }
+  // 右の課題を落とすと紐付く
+  row.addEventListener("dragover", (ev) => {
+    if (!ev.dataTransfer.types.includes("application/x-jira-key")) return;
+    ev.preventDefault();
+    row.classList.add("drop_into");
+  });
+  row.addEventListener("dragleave", () => row.classList.remove("drop_into"));
+  row.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    row.classList.remove("drop_into");
+    const key = ev.dataTransfer.getData("application/x-jira-key");
+    if (key) link_issue(t.id, key);
+  });
+  return row;
+}
+
+/// 右：Jira の課題
+function draw_jira_issues() {
+  const box = $("jira_issues");
+  $("jira_import_all").hidden = true;
+  if (jira.issuesError) {
+    box.replaceChildren(el("p", { class: "empty_hint warn" }, jira.issuesError));
+    return;
+  }
+  if (!jira.issues) {
+    box.replaceChildren(el("p", { class: "empty_hint" }, "「Jira から取得」で課題を読み込みます"));
+    return;
+  }
+  if (!jira.issues.length) {
+    box.replaceChildren(el("p", { class: "empty_hint" }, "条件に合う課題はありません"));
+    return;
+  }
+  const linked = new Map(state.tasks.filter((t) => t.jira_key).map((t) => [t.jira_key, t]));
+  const unlinked = jira.issues.filter((i) => !linked.has(i.key));
+  $("jira_import_all").hidden = unlinked.length === 0;
+  $("jira_import_all").textContent = `未紐付けをすべて取り込む（${unlinked.length} 件）`;
+  const picked = jira.pickedTaskId === null ? null : state.byId.get(jira.pickedTaskId);
+  box.replaceChildren(...jira.issues.map((i) => {
+    const t = linked.get(i.key);
+    const row = el("div", { class: "jira_issue" + (t ? " linked" : ""), draggable: "true", title: "左のタスクにドラッグすると紐付く" },
+      el("div", { class: "jira_issue_head" }, jira_key_link(i.key), el("span", { class: "status" }, i.status)),
+      el("div", { class: "summary" }, i.summary));
+    const foot = el("div", { class: "jira_issue_foot" });
+    if (t) {
+      foot.append(el("span", { class: "linked_to" }, `→ ${[...path_titles(t), t.title].join(" › ")}`));
+    } else {
+      if (picked) {
+        foot.append(el("button", { type: "button", class: "small_button", onclick: () => link_issue(picked.id, i.key) }, `← 「${picked.title}」に紐付け`));
+      }
+      foot.append(el("button", { type: "button", class: "small_button", onclick: () => import_issues([i]) }, "取り込む"));
+    }
+    row.append(foot);
+    row.addEventListener("dragstart", (ev) => {
+      ev.dataTransfer.setData("application/x-jira-key", i.key);
+      ev.dataTransfer.effectAllowed = "link";
+    });
+    return row;
+  }));
+}
+
+async function link_issue(taskId, key) {
+  await update(taskId, { jira_key: key });
+  jira.pickedTaskId = null;
+  if (key) toast(`${key} を紐付けました`);
+}
+
+async function import_issues(issues) {
+  if (!issues.length) return;
+  await api("POST", "/jira/import", { issues: issues.map((i) => ({ key: i.key, summary: i.summary })) });
+  await reload();
+  toast(`Jira から ${issues.length} 件を未分類に取り込みました`);
+}
+
+async function fetch_jira_issues() {
+  jira.jql = $("jira_jql").value.trim() || JIRA_DEFAULT_JQL;
+  save_json("jira_jql", jira.jql);
+  jira.issuesError = null;
+  $("jira_fetch").disabled = true;
+  try {
+    const res = await fetch(`/api/jira/search?jql=${encodeURIComponent(jira.jql)}`);
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) jira.issues = body;
+    else jira.issuesError = body.error || res.statusText;
+  } catch (e) {
+    jira.issuesError = String(e);
+  } finally {
+    $("jira_fetch").disabled = false;
+  }
+  draw_jira_issues();
+}
+
+// ---------- エクスポート ----------
 function draw_jira_draft() {
   const d = jira.draft;
   if (!d) return;
@@ -72,7 +216,9 @@ function draw_jira_draft() {
   $("jira_send").textContent = pending.length ? `Jira に送信（${pending.length} 件）` : "送るものはありません";
 
   const result = (l) => jira.results?.find((r) => r.work_date === l.work_date && r.issue_key === l.issue_key);
-  const rows = d.lines.map((l) => {
+  // 送信済みで変わっていない行は出さない（直前に送った結果だけは残す）
+  const shown = d.lines.filter((l) => l.action !== "unchanged" || result(l));
+  const rows = shown.map((l) => {
     const r = result(l);
     return el("tr", { class: "jira_line " + l.action },
       el("td", {}, short_date(l.work_date)),
@@ -83,14 +229,16 @@ function draw_jira_draft() {
       el("td", {}, el("span", { class: "action_badge " + l.action }, JIRA_ACTION[l.action])),
       el("td", { class: "jira_result" }, r ? (r.error ? el("span", { class: "error" }, r.error) : el("span", { class: "ok" }, "送信しました")) : ""));
   });
-  const table = el("table", { class: "list_table jira_table" },
-    el("thead", {}, el("tr", {},
-      el("th", {}, "日付"), el("th", {}, "課題"), el("th", {}, "まとめたタスク"),
-      el("th", { class: "num" }, "送る時間"), el("th", { class: "num" }, "送信済み"), el("th", {}, "操作"), el("th", {}, ""))),
-    el("tbody", {}, ...(rows.length ? rows : [el("tr", {}, el("td", { colspan: 7, class: "empty_hint" },
-      "この週に、Jira 課題を紐付けたタスクの工数はありません"))])));
-
-  const parts = [table];
+  const parts = [];
+  if (rows.length) {
+    parts.push(el("table", { class: "list_table jira_table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "日付"), el("th", {}, "課題"), el("th", {}, "まとめたタスク"),
+        el("th", { class: "num" }, "送る時間"), el("th", { class: "num" }, "送信済み"), el("th", {}, "操作"), el("th", {}, ""))),
+      el("tbody", {}, ...rows)));
+  } else {
+    parts.push(el("p", { class: "empty_hint" }, "まだ送っていない工数はありません"));
+  }
   if (d.unlinked.length) {
     const total = d.unlinked.reduce((n, u) => n + u.minutes, 0);
     parts.push(el("details", { class: "jira_unlinked" },
@@ -99,46 +247,7 @@ function draw_jira_draft() {
         `${short_date(u.work_date)} ${fmt_hours(u.minutes)} `,
         el("a", { href: "#", onclick: (ev) => { ev.preventDefault(); select(u.task_id); } }, u.task))))));
   }
-  parts.push(el("p", { class: "empty_hint" },
-    "工数記録タブで振り分けた時間を、日ごと・課題ごとにまとめて送ります。課題キーのない子タスクの時間は、紐付けた一番近い親の課題に入ります。送った後に工数を変えたら、もう一度送ると Jira 側も更新・削除されます。"));
   box.replaceChildren(...parts);
-}
-
-function draw_jira_links() {
-  const linked = state.tasks.filter((t) => t.jira_key);
-  const box = $("jira_links");
-  if (!linked.length) {
-    box.replaceChildren(el("p", { class: "empty_hint" }, "まだありません。右の詳細パネルの「Jira 課題」に ABC-123 のように入れると紐付きます。"));
-    return;
-  }
-  const rows = linked.map((t) => {
-    const info = jira.issues.get(t.jira_key);
-    return el("tr", { class: "list_row" + (state.selectedId === t.id ? " selected" : ""), "data-task_id": t.id, onclick: () => select(t.id) },
-      el("td", {}, jira_key_link(t.jira_key)),
-      el("td", { class: "muted" }, info ? (info.error ? el("span", { class: "error" }, info.error) : `${info.summary}（${info.status}）`) : ""),
-      el("td", {}, [...path_titles(t), t.title].join(" › ")),
-      el("td", { class: "num" }, subtree_actual(t) ? fmt_hours(subtree_actual(t)) : ""));
-  });
-  box.replaceChildren(
-    el("table", { class: "list_table" },
-      el("thead", {}, el("tr", {}, el("th", {}, "課題"), el("th", {}, "Jira 側の件名"), el("th", {}, "タスク"), el("th", { class: "num" }, "記録した工数"))),
-      el("tbody", {}, ...rows)),
-    el("div", { class: "jira_buttons" },
-      el("button", { type: "button", class: "small_button", onclick: fetch_issue_titles }, "Jira 側の件名を確認")));
-}
-
-async function fetch_issue_titles() {
-  const keys = [...new Set(state.tasks.filter((t) => t.jira_key).map((t) => t.jira_key))];
-  for (const k of keys) {
-    try {
-      const res = await fetch(`/api/jira/issues/${encodeURIComponent(k)}`);
-      const body = await res.json();
-      jira.issues.set(k, res.ok ? body : { error: body.error || res.statusText });
-    } catch (e) {
-      jira.issues.set(k, { error: String(e) });
-    }
-    draw_jira_links();
-  }
 }
 
 // ---------- 操作 ----------
@@ -169,9 +278,15 @@ function setup_jira() {
     }
     render();
   });
-  $("jira_prev").addEventListener("click", () => { jira.week = add_days(jira.week, -7); jira.results = null; render(); });
-  $("jira_next").addEventListener("click", () => { jira.week = add_days(jira.week, 7); jira.results = null; render(); });
-  $("jira_this_week").addEventListener("click", () => { jira.week = monday_of(today_text()); jira.results = null; render(); });
+  $("jira_fetch").addEventListener("click", fetch_jira_issues);
+  $("jira_jql").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.isComposing) fetch_jira_issues();
+  });
+  $("jira_import_all").addEventListener("click", () => {
+    const linked = new Set(state.tasks.filter((t) => t.jira_key).map((t) => t.jira_key));
+    const unlinked = (jira.issues || []).filter((i) => !linked.has(i.key));
+    if (unlinked.length && confirm(`${unlinked.length} 件の課題を、未分類のタスクとして取り込みますか？`)) import_issues(unlinked);
+  });
   $("jira_send").addEventListener("click", async () => {
     const pending = jira.draft?.lines.filter((l) => l.action !== "unchanged") || [];
     if (!pending.length) return;
@@ -179,7 +294,7 @@ function setup_jira() {
     if (!confirm(`次の ${pending.length} 件を Jira に送ります。\n\n${summary}`)) return;
     $("jira_send").disabled = true;
     try {
-      jira.results = await api("POST", "/jira/send", { from: jira.week, to: add_days(jira.week, 6) });
+      jira.results = await api("POST", "/jira/send", { from: JIRA_ALL_FROM, to: JIRA_ALL_TO });
       const failed = jira.results.filter((r) => r.error).length;
       toast(failed ? `${jira.results.length - failed} 件送信、${failed} 件失敗しました` : `✅ ${jira.results.length} 件を Jira に送信しました`, failed ? "error" : "info");
     } finally {
