@@ -8,6 +8,7 @@ use serde_json::json;
 use super::AppState;
 use crate::model::{MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, TaskPatch};
 use crate::service::agenda_service::{self, Agenda};
+use crate::service::template_service::{self, Template, TemplateSummary};
 use crate::service::work_service::{self, DaySummary, SaveDay, Settings, SettingsPatch, WorkDay};
 use crate::service::{ServiceError, task_service, undo_service};
 
@@ -20,6 +21,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tasks/{id}/move", post(move_task))
         .route("/tasks/move_many", post(move_tasks))
+        .route("/tasks/copy", post(copy_tasks))
+        .route("/tasks/delete_many", post(delete_tasks))
+        .route("/tasks/create_many", post(create_tasks))
         .route("/tasks/{id}/events", get(list_events))
         .route("/agenda", get(get_agenda))
         .route("/tags", get(list_tags))
@@ -37,6 +41,14 @@ pub fn router() -> Router<AppState> {
         .route("/databases", get(list_databases))
         .route("/databases/open", post(open_database))
         .route("/databases/forget", post(forget_database))
+        .route("/templates", get(list_templates).post(save_template))
+        .route(
+            "/templates/{id}",
+            get(get_template)
+                .patch(rename_template)
+                .delete(delete_template),
+        )
+        .route("/templates/{id}/apply", post(apply_template))
         .route("/undo", post(undo))
         .route("/redo", post(redo))
 }
@@ -345,8 +357,7 @@ async fn send_jira(State(s): State<AppState>, Json(q): Json<RangeQuery>) -> Resp
 async fn about(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "build": super::BUILD,
-        "build_time": super::build_time_text(),
+        "build": super::build_id(),
         "db_path": plain_path(&current_db(&s)),
         "windows": cfg!(windows),
     }))
@@ -556,4 +567,143 @@ async fn move_tasks(State(s): State<AppState>, Json(req): Json<MoveMany>) -> Api
         })
     })
     .map(Json)
+}
+
+/// タスクを子孫ごと複製して貼り付ける（1 回の操作として元に戻せる）
+async fn copy_tasks(State(s): State<AppState>, Json(req): Json<MoveMany>) -> ApiResult<Vec<Task>> {
+    let label = format!("{} 件の貼り付け", req.ids.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            task_service::copy_tasks(c, &req.ids, req.placement)
+        })
+    })
+    .map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct CreateMany {
+    titles: Vec<String>,
+    placement: Placement,
+}
+
+/// 複数行の文字から 1 行 1 タスクで作る（ほかのアプリからの貼り付け）
+async fn create_tasks(
+    State(s): State<AppState>,
+    Json(req): Json<CreateMany>,
+) -> ApiResult<Vec<Task>> {
+    let label = format!("{} 行の貼り付け", req.titles.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            task_service::create_tasks(c, &req.titles, req.placement)
+        })
+    })
+    .map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteMany {
+    ids: Vec<i64>,
+}
+
+/// 複数のタスクを子孫ごとまとめて削除する（1 回の操作として元に戻せる）
+async fn delete_tasks(
+    State(s): State<AppState>,
+    Json(req): Json<DeleteMany>,
+) -> Result<StatusCode, ApiError> {
+    let label = format!("{} 件の削除", req.ids.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| task_service::delete_tasks(c, &req.ids))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- テンプレート ----------
+
+async fn list_templates(State(s): State<AppState>) -> ApiResult<Vec<TemplateSummary>> {
+    with_conn(&s, template_service::list_templates).map(Json)
+}
+
+async fn get_template(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<Template> {
+    with_conn(&s, |c| template_service::get_template(c, id)).map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct SaveTemplate {
+    name: String,
+    ids: Vec<i64>,
+}
+
+async fn save_template(
+    State(s): State<AppState>,
+    Json(req): Json<SaveTemplate>,
+) -> ApiResult<TemplateSummary> {
+    let label = format!("テンプレート『{}』の保存", req.name.trim());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            template_service::save_template(c, &req.name, &req.ids)
+        })
+    })
+    .map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct RenameTemplate {
+    name: String,
+}
+
+async fn rename_template(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<RenameTemplate>,
+) -> ApiResult<TemplateSummary> {
+    let label = format!("テンプレートの名前を『{}』に変更", req.name.trim());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            template_service::rename_template(c, id, &req.name)
+        })
+    })
+    .map(Json)
+}
+
+async fn delete_template(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    with_conn(&s, |c| {
+        let label = format!(
+            "テンプレート『{}』の削除",
+            template_service::get_template(c, id)?.summary.name
+        );
+        undo_service::record(c, &label, |c| template_service::delete_template(c, id))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyTemplate {
+    start_date: String,
+    placement: Placement,
+}
+
+#[derive(serde::Serialize)]
+struct Applied {
+    /// 作ったタスクの数（子を含む）
+    created: usize,
+}
+
+async fn apply_template(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<ApplyTemplate>,
+) -> ApiResult<Applied> {
+    with_conn(&s, |c| {
+        let label = format!(
+            "テンプレート『{}』から作成",
+            template_service::get_template(c, id)?.summary.name
+        );
+        undo_service::record(c, &label, |c| {
+            template_service::apply_template(c, id, &req.start_date, req.placement)
+        })
+    })
+    .map(|created| Json(Applied { created }))
 }

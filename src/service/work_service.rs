@@ -61,6 +61,9 @@ str_enum! {
 pub struct Suggestion {
     pub task_id: i64,
     pub reason: SuggestReason,
+    /// 記録がなくても候補に出る（その日に完了・線表でその日にバーが重なる）。
+    /// 画面で振り分けから外しても戻ってくるので、外すボタンを出さない
+    pub always_suggested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -204,14 +207,14 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
              COALESCE(planned_end, CASE WHEN status = ?6 THEN substr(completed_at, 1, 10) END) AS e \
            FROM task \
          ) \
-         SELECT task_id, reason FROM ( \
+         SELECT task_id, CASE MIN(p) WHEN 1 THEN ?3 WHEN 2 THEN ?4 ELSE ?5 END, MAX(p) > 1 FROM ( \
            SELECT task_id, ?3 AS reason, 1 AS p FROM time_entry WHERE work_date = ?1 \
            UNION ALL SELECT id, ?4, 2 FROM task WHERE substr(completed_at, 1, 10) = ?1 \
            UNION ALL SELECT id, ?5, 3 FROM span WHERE \
              (s IS NOT NULL AND e IS NOT NULL AND s <= ?1 AND e >= ?1) \
              OR (s IS NULL AND e = ?1) \
              OR (e IS NULL AND s IS NOT NULL AND status != ?6 AND s <= ?1 AND ?1 <= ?2) \
-         ) GROUP BY task_id HAVING p = MIN(p) ORDER BY MIN(p), task_id",
+         ) GROUP BY task_id ORDER BY MIN(p), task_id",
     )?;
     let suggestions = stmt
         .query_map(
@@ -227,6 +230,7 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
                 Ok(Suggestion {
                     task_id: r.get(0)?,
                     reason: r.get(1)?,
+                    always_suggested: r.get(2)?,
                 })
             },
         )?
@@ -435,6 +439,43 @@ mod tests {
             ),
             Err(ServiceError::NotFound(999))
         ));
+    }
+
+    /// 記録済みでも、線表で重なるものは「記録を消しても候補に残る」
+    #[test]
+    fn always_suggested_marks_tasks_that_come_back() {
+        let conn = db::open_in_memory().unwrap();
+        let planned = add(&conn, "予定期間");
+        let other = add(&conn, "予定なし");
+        let p: TaskPatch =
+            serde_json::from_str(r#"{"planned_start":"2030-01-08","planned_end":"2030-01-12"}"#)
+                .unwrap();
+        ts::update_task(&conn, planned, p).unwrap();
+        save_day(
+            &conn,
+            "2030-01-10",
+            SaveDay {
+                worked_min: 480,
+                allocations: vec![
+                    Allocation {
+                        task_id: planned,
+                        weight: 1.0,
+                    },
+                    Allocation {
+                        task_id: other,
+                        weight: 1.0,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let day = get_day(&conn, "2030-01-10").unwrap();
+        let s: Vec<_> = day
+            .suggestions
+            .iter()
+            .map(|s| (s.task_id, s.reason.as_str(), s.always_suggested))
+            .collect();
+        assert_eq!(s, [(planned, "recorded", true), (other, "recorded", false)]);
     }
 
     #[test]

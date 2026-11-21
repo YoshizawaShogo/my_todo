@@ -170,7 +170,7 @@ pub fn list_events(conn: &Connection, task_id: i64) -> ServiceResult<Vec<TaskEve
 
 /// 兄弟の集合。最上位は未分類とタスク一覧に分かれる。
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Siblings {
+pub(crate) enum Siblings {
     Child(i64),
     Root { inbox: bool },
 }
@@ -186,7 +186,7 @@ impl Siblings {
     }
 
     /// sort_order 順の兄弟 id 一覧
-    fn ids(self, conn: &Connection) -> ServiceResult<Vec<i64>> {
+    pub(crate) fn ids(self, conn: &Connection) -> ServiceResult<Vec<i64>> {
         let mut ids = Vec::new();
         match self {
             Siblings::Child(p) => {
@@ -625,22 +625,16 @@ pub fn move_task(conn: &Connection, id: i64, target: MoveTarget) -> ServiceResul
     get_task(conn, id)
 }
 
-/// 複数のタスクを、並び順を保ったまままとめて移動する。
-/// ids は画面での並び順。ほかの選択されたタスクの子孫は、親と一緒に動くので個別には動かさない
-pub fn move_tasks(
-    conn: &Connection,
-    ids: &[i64],
-    placement: Placement,
-) -> ServiceResult<Vec<Task>> {
-    let tx = Tx::begin(conn)?;
-    // 親子を一緒に選んでいたら親だけ
+/// 選んだタスクのうち、ほかの選んだタスクの子孫でないものだけ（並び順は保つ）。
+/// 親と子を一緒に選んだときは、親を動かせば子もついてくるので親だけにする
+pub(crate) fn top_level_only(conn: &Connection, ids: &[i64]) -> ServiceResult<Vec<i64>> {
     let is_descendant_of_other = |id: i64| -> ServiceResult<bool> {
-        let mut cur = get_task(&tx, id)?.parent_id;
+        let mut cur = get_task(conn, id)?.parent_id;
         while let Some(p) = cur {
             if ids.contains(&p) {
                 return Ok(true);
             }
-            cur = get_task(&tx, p)?.parent_id;
+            cur = get_task(conn, p)?.parent_id;
         }
         Ok(false)
     };
@@ -650,6 +644,96 @@ pub fn move_tasks(
             targets.push(id);
         }
     }
+    Ok(targets)
+}
+
+/// タスクを子孫ごと複製して placement の場所に置く（コピー＆貼り付け）。
+/// 名前・メモ・日程・次の予定・タグ・見積もりを写す。状態は未着手に戻し、
+/// Jira の課題キーは写さない（工数が同じ課題に二重に送られないように）
+pub fn copy_tasks(
+    conn: &Connection,
+    ids: &[i64],
+    placement: Placement,
+) -> ServiceResult<Vec<Task>> {
+    let tx = Tx::begin(conn)?;
+    let mut copies = Vec::new();
+    for id in top_level_only(&tx, ids)? {
+        copies.push(copy_subtree(&tx, id, None)?);
+    }
+    let moved = move_tasks(&tx, &copies, placement)?;
+    tx.commit()?;
+    Ok(moved)
+}
+
+/// 1 件を複製し、子を同じ順で複製してその下に付ける。複製の id を返す
+fn copy_subtree(conn: &Connection, id: i64, parent_id: Option<i64>) -> ServiceResult<i64> {
+    let t = get_task(conn, id)?;
+    let copy = create_task(
+        conn,
+        NewTask {
+            title: t.title.clone(),
+            parent_id,
+            note: t.note.clone(),
+            inbox: Some(true),
+        },
+    )?;
+    update_task(
+        conn,
+        copy.id,
+        TaskPatch {
+            planned_start: Some(t.planned_start.clone()),
+            planned_end: Some(t.planned_end.clone()),
+            next_action: Some(t.next_action.clone()),
+            next_action_date: Some(t.next_action_date.clone()),
+            tags: Some(t.tags.clone()),
+            estimate_min: Some(t.estimate_min),
+            ..Default::default()
+        },
+    )?;
+    for child in Siblings::Child(id).ids(conn)? {
+        copy_subtree(conn, child, Some(copy.id))?;
+    }
+    Ok(copy.id)
+}
+
+/// 複数行の文字から、1 行 1 タスクで作って placement の場所に置く（ほかのアプリからの貼り付け）
+pub fn create_tasks(
+    conn: &Connection,
+    titles: &[String],
+    placement: Placement,
+) -> ServiceResult<Vec<Task>> {
+    let tx = Tx::begin(conn)?;
+    let mut ids = Vec::new();
+    for title in titles.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        ids.push(
+            create_task(
+                &tx,
+                NewTask {
+                    title: title.to_string(),
+                    inbox: Some(true),
+                    ..Default::default()
+                },
+            )?
+            .id,
+        );
+    }
+    if ids.is_empty() {
+        return Err(ServiceError::Invalid("貼り付ける文字がありません".into()));
+    }
+    let moved = move_tasks(&tx, &ids, placement)?;
+    tx.commit()?;
+    Ok(moved)
+}
+
+/// 複数のタスクを、並び順を保ったまままとめて移動する。
+/// ids は画面での並び順。ほかの選択されたタスクの子孫は、親と一緒に動くので個別には動かさない
+pub fn move_tasks(
+    conn: &Connection,
+    ids: &[i64],
+    placement: Placement,
+) -> ServiceResult<Vec<Task>> {
+    let tx = Tx::begin(conn)?;
+    let targets = top_level_only(&tx, ids)?;
     // 基準のタスクを動かす対象にはできない
     if let Placement::Before { ref_id } | Placement::After { ref_id } = placement
         && targets.contains(&ref_id)
@@ -712,6 +796,17 @@ pub fn move_tasks(
     }
     tx.commit()?;
     Ok(moved)
+}
+
+/// 複数のタスクを子孫ごとまとめて削除する（ほかの選んだタスクの子孫は親と一緒に消えるので個別には消さない）
+pub fn delete_tasks(conn: &Connection, ids: &[i64]) -> ServiceResult<usize> {
+    let tx = Tx::begin(conn)?;
+    let targets = top_level_only(&tx, ids)?;
+    for &id in &targets {
+        delete_task(&tx, id)?;
+    }
+    tx.commit()?;
+    Ok(targets.len())
 }
 
 /// 子孫もまとめて削除する。
@@ -1060,6 +1155,84 @@ mod tests {
         );
         assert!(err.is_err());
         assert_eq!(titles(Siblings::Root { inbox: true }), ["親", "a", "b"]);
+    }
+
+    #[test]
+    fn copy_duplicates_subtree_with_fields_but_fresh_state() {
+        let conn = db::open_in_memory().unwrap();
+        let p = add(&conn, "親", None).id;
+        let a = add(&conn, "a", Some(p)).id;
+        let a1 = add(&conn, "a1", Some(a)).id;
+        add(&conn, "a2", Some(a));
+        let b = add(&conn, "b", Some(p)).id;
+        let patch: TaskPatch = serde_json::from_str(
+            r#"{"status":"done","planned_start":"2026-11-20","planned_end":"2026-11-25","tags":["x"],"estimate_min":120,"jira_key":"ABC-1","note":"メモ"}"#,
+        )
+        .unwrap();
+        update_task(&conn, a, patch).unwrap();
+
+        // a と、その子の a1 を一緒にコピー → a1 は a と一緒に複製されるので 1 回だけ
+        let copies = copy_tasks(&conn, &[a, a1], Placement::After { ref_id: b }).unwrap();
+        assert_eq!(copies.len(), 1);
+        let c = &copies[0];
+        assert_eq!(c.parent_id, Some(p));
+        assert_eq!((c.title.as_str(), c.note.as_deref()), ("a", Some("メモ")));
+        assert_eq!(
+            (c.planned_start.as_deref(), c.planned_end.as_deref()),
+            (Some("2026-11-20"), Some("2026-11-25"))
+        );
+        assert_eq!(
+            (c.tags.clone(), c.estimate_min),
+            (vec!["x".to_string()], Some(120))
+        );
+        assert_eq!(c.status, TaskStatus::Todo);
+        assert_eq!(c.jira_key, None);
+        assert_eq!(child_titles(&conn, Siblings::Child(p)), ["a", "b", "a"]);
+        assert_eq!(child_titles(&conn, Siblings::Child(c.id)), ["a1", "a2"]);
+    }
+
+    #[test]
+    fn create_tasks_from_lines() {
+        let conn = db::open_in_memory().unwrap();
+        let made = create_tasks(
+            &conn,
+            &["一つ目".into(), "  ".into(), " 二つ目 ".into()],
+            Placement::Into {
+                parent_id: None,
+                inbox: true,
+            },
+        )
+        .unwrap();
+        let titles: Vec<_> = made.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["一つ目", "二つ目"]);
+        assert!(
+            create_tasks(
+                &conn,
+                &["".into()],
+                Placement::Into {
+                    parent_id: None,
+                    inbox: true
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_many_removes_subtrees_once() {
+        let conn = db::open_in_memory().unwrap();
+        let p = add(&conn, "親", None).id;
+        let a = add(&conn, "a", Some(p)).id;
+        let a1 = add(&conn, "a1", Some(a)).id;
+        let b = add(&conn, "b", Some(p)).id;
+        add(&conn, "c", Some(p));
+        // a とその子 a1、b を選んで削除 → a1 は a と一緒に消える
+        assert_eq!(delete_tasks(&conn, &[a, a1, b]).unwrap(), 2);
+        assert_eq!(child_titles(&conn, Siblings::Child(p)), ["c"]);
+        assert!(get_task(&conn, a1).is_err());
+        // 存在しないタスクが混じっていたら何も消さない
+        assert!(delete_tasks(&conn, &[p, 9999]).is_err());
+        assert!(get_task(&conn, p).is_ok());
     }
 
     #[test]

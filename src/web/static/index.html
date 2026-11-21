@@ -42,6 +42,23 @@
             <button type="button" class="small_button" id="gantt_prev">◀ 前の週</button>
             <button type="button" class="small_button" id="gantt_today">今日</button>
             <button type="button" class="small_button" id="gantt_next">次の週 ▶</button>
+            <span class="template_switch">
+              <div class="template_panel" id="template_panel" hidden>
+                <section class="template_part">
+                  <h3 class="template_heading">保存する</h3>
+                  <p class="template_hint">線表・未分類で選んだタスク（子も含む）を、テンプレートとして残します</p>
+                  <button type="button" class="small_button" id="template_save">選んだタスクをテンプレートとして保存</button>
+                </section>
+                <section class="template_part">
+                  <h3 class="template_heading">使う</h3>
+                  <label class="template_start_row">開始日
+                    <input type="date" id="template_start">
+                  </label>
+                  <p class="template_hint">一番早い日付がこの日になり、ほかの日付も同じ平日の数でずれます（土日は数えない）。作る場所は、選んでいるタスクの後ろ（なければ線表の末尾）</p>
+                  <div id="template_list"></div>
+                </section>
+              </div>
+            </span>
             <span class="gantt_range" id="gantt_range"></span>
             <span class="gantt_legend">
               <span class="legend_bar todo"></span>未着手
@@ -61,6 +78,7 @@
             <button id="gfilter_clear" class="small_button" type="button" hidden>解除</button>
           </div>
           <div class="gantt_scroll" id="gantt"></div>
+          <div class="gantt_trash" id="gantt_trash" hidden>🗑️ ここに入れると日程を消す</div>
         </section>
         <section class="list_section inbox_section">
           <h2 class="section_title" id="inbox_header" title="ここに落とすと未分類へ戻す">未分類
@@ -289,6 +307,8 @@
   <script src="/help.js"></script>
   <script src="/database.js"></script>
   <script src="/alerts.js"></script>
+  <script src="/clipboard.js"></script>
+  <script src="/templates.js"></script>
   <script>setup();</script>
 </body>
 </html>

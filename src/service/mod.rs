@@ -2,8 +2,10 @@
 //! HTTP などの通信には依存しない。
 
 pub mod agenda_service;
+pub mod calendar;
 pub mod jira_service;
 pub mod task_service;
+pub mod template_service;
 pub mod undo_service;
 pub mod work_service;
 

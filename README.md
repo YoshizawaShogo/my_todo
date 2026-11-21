@@ -32,11 +32,14 @@ cargo run --release
   - ドラッグで並べ替え・階層変更：行の上端・下端に落とすと前後に、中央に落とすと子になる。左上の「タスク」に落とすと最上位の末尾へ
   - チェックで完了／未着手に戻す。ダブルクリックで名前を変更。行のタグをクリックすると絞り込み
   - Shift＋クリックで範囲、Ctrl＋クリックで 1 件ずつ選べる。選んだ行をドラッグするとまとめて移動（並び順を保つ。Ctrl+Z 1 回で戻る）
+  - Ctrl+C／Ctrl+X／Ctrl+V で、選んだタスク（子も含む）をコピー／切り取り／貼り付け。貼り付け先は選んでいるタスクの後ろ（なければ未分類の末尾）。コピーは複製（状態は未着手、Jira の課題キーは写さない）、切り取りは移動。ほかのアプリでコピーした文字は 1 行 1 タスクになる
 - 右の時間軸（6 週間分。ホイールで行の上下スクロール、Shift＋ホイールで 1 日単位で前後に動く。「前の週」「次の週」「今日」でも移動）
   - バーは開始予定日（なければ着手日）から終了予定日まで。終了予定日だけなら ◆、次の予定は ▶
   - 色：未着手は薄い青、作業中は青、完了は緑（予定の期間、なければ着手日〜完了日）。終了予定日を過ぎた未完了は赤枠
   - 子を持つ親には、子の範囲を横に倒した I（箱ひげ図のひげ）で出す
-  - 開始日・終了日がそろっていない行は、横にドラッグした範囲が開始予定日〜終了予定日になる。バーの中央をドラッグで移動、両端をドラッグで期間を増減
+  - 開始日・終了日がそろっていない行は、横にドラッグした範囲が開始予定日〜終了予定日になる。バーの中央をドラッグで移動、両端をドラッグで期間を増減。移動中に右下に出るゴミ箱に入れると日程だけを消す
+  - 選んだタスクは Delete キーか 🗑️ でまとめて削除（子も一緒に）。名前をドラッグしてゴミ箱に入れるとタスクを削除
+- テンプレート：タスク（子を含む）を選んで保存し、「使う」で開始日を選んで作り直す。日程は一番早い日付からの平日の数（土日を除く。祝日は考えない）で残り、使う先でも平日で数える。データベースの中に保存（Ctrl+Z・MCP の対象）
 - 絞り込み：キーワード、タグ（いずれかを含む。親のタグは子にも効く）、「完了を隠す」。条件に合うタスクの祖先は薄く表示する
 
 ### 詳細（すべてのタスクを表で）
@@ -80,7 +83,7 @@ Claude Desktop などの設定ファイルでは：
 { "mcpServers": { "my_todo": { "command": "C:\\tools\\my_todo\\my_todo.exe", "args": ["mcp", "--db", "C:\\tools\\my_todo\\my_todo.db"] } } }
 ```
 
-ツール：`get_schedule`（今日・今週の予定）、`list_tasks`、`get_task`、`add_todo`、`update_task`、`move_task`、`delete_task`、`get_work_day`、`log_work_day`、`list_tags`、`undo`、`redo`
+ツール：`get_schedule`（今日・今週の予定）、`list_tasks`、`get_task`、`add_todo`、`update_task`、`move_task`、`delete_task`、`get_work_day`、`log_work_day`、`list_tags`、`list_templates`、`apply_template`（テンプレートから作る）、`undo`、`redo`
 
 ## Jira 連携
 
@@ -135,6 +138,8 @@ src/web/static/         画面（共通は app.js、線表は gantt.js、詳細�
 | GET | `/api/tasks/{id}` | 1 件取得 |
 | PATCH | `/api/tasks/{id}` | 更新 `{title?, status?, note?, planned_start?, planned_end?, next_action?, next_action_date?, tags?, estimate_min?}`。tags は一覧で置き換え。status は `todo` / `doing` / `done`、日付は `YYYY-MM-DD`、null で取り消し |
 | POST | `/api/tasks/{id}/move` | 移動 `{parent_id, inbox, index?}` |
+| POST | `/api/tasks/copy` | 子孫ごと複製して貼り付け `{ids, placement}` |
+| POST | `/api/tasks/create_many` | 1 行 1 タスクで作る `{titles, placement}` |
 | POST | `/api/tasks/move_many` | まとめて移動 `{ids, placement: {kind: "before"/"after", ref_id} / {kind: "into", parent_id?, inbox}}` |
 | DELETE | `/api/tasks/{id}` | 子孫ごと削除 |
 | GET | `/api/agenda?today=YYYY-MM-DD` | 予定一覧（期限切れ・今日・今週・来週）。today 省略時はサーバーの今日 |

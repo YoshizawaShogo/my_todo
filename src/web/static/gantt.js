@@ -23,6 +23,7 @@ function setup_gantt() {
   $("inbox_add").addEventListener("click", () => begin_add("inbox"));
   attach_group_drop($("inbox_header"), "inbox");
   setup_gantt_wheel();
+  setup_trash();
 
   let timer;
   $("gfilter_text").addEventListener("input", (ev) => {
@@ -95,6 +96,34 @@ function setup_gantt_wheel() {
       });
     }
   }, { passive: false });
+}
+
+// ---------- ゴミ箱 ----------
+/// 右下のゴミ箱を出す・隠す。"bar"（バーを運ぶ＝日程だけ消す）/ "task"（行を運ぶ＝タスクを削除）/ null（隠す）
+function show_trash(kind) {
+  const t = $("gantt_trash");
+  t.hidden = kind === null;
+  t.classList.remove("over");
+  t.classList.toggle("task_mode", kind === "task");
+  if (kind === "bar") t.textContent = "🗑️ ここに入れると日程を消す";
+  if (kind === "task") t.textContent = "🗑️ ここに入れるとタスクを削除";
+}
+
+/// 行（名前）のドラッグをゴミ箱で受けて、タスクを削除する
+function setup_trash() {
+  const t = $("gantt_trash");
+  t.addEventListener("dragover", (ev) => {
+    if (state.dragId === null) return;
+    ev.preventDefault();
+    t.classList.add("over");
+  });
+  t.addEventListener("dragleave", () => t.classList.remove("over"));
+  t.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    const ids = state.dragIds || (state.dragId === null ? [] : [state.dragId]);
+    show_trash(null);
+    delete_tasks_confirm(ids);
+  });
 }
 
 // ---------- 絞り込み ----------
@@ -221,7 +250,14 @@ function render_gantt() {
   // 左上の「タスク」に落とすと、最上位の末尾へ移す
   const corner = el("div", { class: "gantt_name", title: "ここに落とすと最上位の末尾へ" },
     el("span", { class: "corner_label" }, "タスク"),
-    el("button", { type: "button", class: "small_button", title: "線表にタスクを追加", onclick: () => begin_add("root") }, "➕ 追加"));
+    el("button", { type: "button", class: "small_button", title: "線表にタスクを追加", onclick: () => begin_add("root") }, "➕ 追加"),
+    el("button", {
+      type: "button",
+      class: "small_button",
+      id: "template_button",
+      title: "タスクの木を型として保存し、開始日を選んで作り直す",
+      onclick: (ev) => { ev.stopPropagation(); toggle_template_panel(); },
+    }, "テンプレート"));
   attach_group_drop(corner, "root");
   const header = el("div", { class: "gantt_header" }, corner, days);
 
@@ -458,6 +494,7 @@ function attach_gantt_drag(track, t, span, ctx) {
     let moved = false;
     let range = null;
     let preview = null;
+    let overTrash = false; // バーをゴミ箱の上まで運んだか（移動のときだけ）
     const label = el("div", { class: "drag_label" });
 
     const compute = (x) => {
@@ -484,6 +521,19 @@ function attach_gantt_drag(track, t, span, ctx) {
         track.append(preview);
         document.body.append(label);
         original?.classList.add("drag_source");
+        if (mode === "move") show_trash("bar");
+      }
+      if (mode === "move") {
+        const r = $("gantt_trash").getBoundingClientRect();
+        overTrash = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+        $("gantt_trash").classList.toggle("over", overTrash);
+        if (overTrash) {
+          preview.hidden = true;
+          label.textContent = "離すと日程（開始予定日・終了予定日）を消します";
+          label.style.left = `${e.clientX - 260}px`;
+          label.style.top = `${e.clientY - 30}px`;
+          return;
+        }
       }
       range = compute(e.clientX);
       const [s, en] = range;
@@ -508,6 +558,14 @@ function attach_gantt_drag(track, t, span, ctx) {
       label.remove();
       preview?.remove();
       original?.classList.remove("drag_source");
+      show_trash(null);
+      if (commit && moved && overTrash) {
+        // ゴミ箱に入れた：日程だけ消す（タスクは残る）
+        update(t.id, { planned_start: null, planned_end: null })
+          .then(() => toast(`「${t.title}」の日程を消しました（Ctrl+Z で元に戻す）`))
+          .catch(() => render());
+        return;
+      }
       if (!commit || !moved || !range) return;
       const [s, e] = range;
       // 変化なし（実績から引いたバーは、予定として確定させるため保存する）

@@ -197,6 +197,11 @@ async function set_done(task, done) {
 }
 
 async function remove(id) {
+  // 選んでいる行で、選択が 2 件以上なら選んだものをまとめて消す
+  if (is_selected(id) && state.selected.size > 1) {
+    await delete_tasks_confirm(visible_task_order().filter((x) => state.selected.has(x)));
+    return;
+  }
   const task = state.byId.get(id);
   const n = count_descendants(id);
   const msg = n > 0
@@ -208,6 +213,23 @@ async function remove(id) {
   state.selected.delete(id);
   await reload();
   toast(`🗑️「${task.title}」を削除しました（Ctrl+Z で元に戻す）`);
+}
+
+/// 複数のタスクを子孫ごとまとめて削除する（確認してから。Ctrl+Z 1 回で戻る）
+async function delete_tasks_confirm(ids) {
+  ids = ids.filter((id) => state.byId.has(id));
+  if (!ids.length) return;
+  if (ids.length === 1) return remove(ids[0]);
+  // 選んだものの子孫は親と一緒に消えるので、親だけ数える
+  const tops = ids.filter((id) => !ids.some((other) => other !== id && is_self_or_descendant(other, id)));
+  const kids = tops.reduce((n, id) => n + count_descendants(id), 0);
+  const msg = `🗑️ ${tops.length} 件のタスク${kids ? `（と子タスク ${kids} 件）` : ""}を削除しますか？\n（削除したあとでも Ctrl+Z で元に戻せます）`;
+  if (!confirm(msg)) return;
+  await api("POST", "/tasks/delete_many", { ids });
+  state.selected = new Set();
+  state.selectedId = null;
+  await reload();
+  toast(`🗑️ ${tops.length} 件を削除しました（Ctrl+Z で元に戻す）`);
 }
 
 // ---------- 元に戻す・やり直し ----------
@@ -394,6 +416,7 @@ function render() {
   else if (state.tab === "work") render_work();
   else if (state.tab === "jira") render_jira();
   else render_help();
+  mark_cut_rows();
   render_detail();
 }
 
@@ -494,6 +517,7 @@ function attach_tree_drag(handle, rowEl, task) {
     state.dragIds = ids;
     ev.dataTransfer.effectAllowed = "move";
     ev.dataTransfer.setData("text/plain", ids.join(","));
+    show_trash("task");
     if (ids.length > 1) {
       const ghost = el("div", { class: "drag_ghost" }, `${ids.length} 件を移動`);
       document.body.append(ghost);
@@ -505,6 +529,7 @@ function attach_tree_drag(handle, rowEl, task) {
     state.dragId = null;
     state.dragIds = null;
     clear_drop_marks();
+    show_trash(null);
   });
   rowEl.addEventListener("dragover", (ev) => {
     if (state.dragId === null || dragging_onto_self(task.id)) return;
@@ -825,6 +850,12 @@ function setup() {
     if (ev.key === "/" && !typing && !mod) {
       ev.preventDefault();
       begin_add("inbox");
+    } else if (ev.key === "Delete" && !typing && !mod && state.tab === "gantt" && state.selected.size > 0) {
+      ev.preventDefault();
+      delete_tasks_confirm(visible_task_order().filter((id) => state.selected.has(id)));
+    } else if (ev.key === "Escape" && !typing && clip.mode === "cut") {
+      clear_cut();
+      toast("切り取りをやめました");
     } else if (ev.key === "Escape" && !typing && state.selectedId !== null) {
       select(null);
     }
@@ -841,6 +872,8 @@ function setup() {
   setup_jira();
   setup_databases();
   setup_alerts();
+  setup_clipboard();
+  setup_templates();
   load_jira_config().then(() => render_detail());
   setup_detail();
   reload();

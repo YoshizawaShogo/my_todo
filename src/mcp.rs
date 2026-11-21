@@ -11,9 +11,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use crate::model::{MoveTarget, NewTask, Task, TaskPatch, TaskStatus};
+use crate::model::{MoveTarget, NewTask, Placement, Task, TaskPatch, TaskStatus};
 use crate::service::work_service::{self, Allocation, SaveDay};
-use crate::service::{ServiceError, agenda_service, task_service, undo_service};
+use crate::service::{ServiceError, agenda_service, task_service, template_service, undo_service};
 
 /// 対応する MCP のプロトコルの版（新しい順）。クライアントが求めた版に対応していればそれを返す
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -107,6 +107,8 @@ str_enum! {
         GetWorkDay => "get_work_day",
         LogWorkDay => "log_work_day",
         ListTags => "list_tags",
+        ListTemplates => "list_templates",
+        ApplyTemplate => "apply_template",
         Undo => "undo",
         Redo => "redo",
     }
@@ -253,6 +255,24 @@ impl Tool {
                 "inputSchema": { "type": "object", "properties": {} },
                 "annotations": { "readOnlyHint": true },
             }),
+            Tool::ListTemplates => json!({
+                "name": self.as_str(),
+                "title": "テンプレートの一覧",
+                "description": "保存されたテンプレート（タスクの木の型）と、項目数・期間（日数）。中身も返す。日付は基準日から何日目か（offset）で入っている。",
+                "inputSchema": { "type": "object", "properties": {} },
+                "annotations": { "readOnlyHint": true },
+            }),
+            Tool::ApplyTemplate => json!({
+                "name": self.as_str(),
+                "title": "テンプレートから作る",
+                "description": "テンプレートからタスク（子を含む）を作る。日付は start_date を基準日として、保存したときと同じ間隔でずらす。状態は未着手。undo で元に戻せる。",
+                "inputSchema": { "type": "object", "properties": {
+                    "template_id": { "type": "integer" },
+                    "start_date": { "type": "string", "description": "基準日（YYYY-MM-DD）。省略で今日" },
+                    "parent_id": { "type": "integer", "description": "この親の子として作る" },
+                    "to": { "type": "string", "enum": ["tasks", "inbox"], "description": "parent_id を省略したときの置き場所。既定 tasks（線表の最上位の末尾）" }
+                }, "required": ["template_id"] },
+            }),
             Tool::Undo => json!({
                 "name": self.as_str(),
                 "title": "元に戻す",
@@ -316,7 +336,12 @@ fn arg_i64(args: &Value, key: &str) -> std::result::Result<i64, String> {
 }
 
 fn arg_date(args: &Value) -> std::result::Result<String, String> {
-    match args.get("date").and_then(Value::as_str) {
+    arg_named_date(args, "date")
+}
+
+/// 日付の引数（省略・空なら今日）
+fn arg_named_date(args: &Value, key: &str) -> std::result::Result<String, String> {
+    match args.get(key).and_then(Value::as_str) {
         Some(d) if !d.is_empty() => Ok(d.to_string()),
         _ => Ok(crate::service::today().to_string()),
     }
@@ -454,6 +479,30 @@ fn run_tool(conn: &Connection, name: &str, args: &Value) -> ToolResult {
             work_day_result(conn, &date)
         }
         Tool::ListTags => Ok(json!({ "tags": svc(task_service::list_tags(conn))? })),
+        Tool::ListTemplates => {
+            let list = svc(template_service::list_templates(conn))?;
+            let templates = list
+                .iter()
+                .map(|t| svc(template_service::get_template(conn, t.id)))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(json!({ "templates": templates }))
+        }
+        Tool::ApplyTemplate => {
+            let id = arg_i64(args, "template_id")?;
+            let date = arg_named_date(args, "start_date")?;
+            let placement = Placement::Into {
+                parent_id: args.get("parent_id").and_then(Value::as_i64),
+                inbox: args.get("to").and_then(Value::as_str) == Some("inbox"),
+            };
+            let name = svc(template_service::get_template(conn, id))?.summary.name;
+            let label = format!("AI:テンプレート『{name}』から作成");
+            let created = svc(undo_service::record(conn, &label, |c| {
+                template_service::apply_template(c, id, &date, placement)
+            }))?;
+            Ok(
+                json!({ "template": name, "start_date": date, "created": created, "hint": "undo ツールか画面の Ctrl+Z で元に戻せます" }),
+            )
+        }
         Tool::Undo => Ok(json!({ "undone": svc(undo_service::undo(conn))? })),
         Tool::Redo => Ok(json!({ "redone": svc(undo_service::redo(conn))? })),
     }
@@ -809,11 +858,15 @@ mod tests {
         let id = tool(&conn, "add_todo", json!({ "title": "a", "tags": ["x"] }))["structuredContent"]["id"]
             .as_i64()
             .unwrap();
+        let tpl = template_service::save_template(&conn, "型", &[id])
+            .unwrap()
+            .id;
         let args = |t: Tool| match t {
             Tool::GetTask | Tool::UpdateTask | Tool::MoveTask | Tool::DeleteTask => {
                 json!({ "id": id })
             }
             Tool::AddTodo => json!({ "title": "b" }),
+            Tool::ApplyTemplate => json!({ "template_id": tpl, "start_date": "2026-12-01" }),
             Tool::LogWorkDay => {
                 json!({ "date": "2026-11-20", "worked_hours": 8, "allocations": [] })
             }
@@ -821,6 +874,7 @@ mod tests {
             | Tool::ListTasks
             | Tool::GetWorkDay
             | Tool::ListTags
+            | Tool::ListTemplates
             | Tool::Undo
             | Tool::Redo => json!({}),
         };

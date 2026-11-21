@@ -109,9 +109,9 @@ pub async fn serve(
     });
     wait_until_reachable(&url).await;
     println!(
-        "my_todo {}（ビルド {}）: {url} で起動しました（Ctrl+C で終了）",
+        "my_todo {}（版 {}）: {url} で起動しました（Ctrl+C で終了）",
         env!("CARGO_PKG_VERSION"),
-        build_time_text()
+        build_id()
     );
     if open_browser {
         open_url(&url);
@@ -236,6 +236,16 @@ const STATIC_FILES: &[(&str, &str, &str)] = &[
     ),
     ("app.js", "text/javascript", include_str!("static/app.js")),
     (
+        "clipboard.js",
+        "text/javascript",
+        include_str!("static/clipboard.js"),
+    ),
+    (
+        "templates.js",
+        "text/javascript",
+        include_str!("static/templates.js"),
+    ),
+    (
         "database.js",
         "text/javascript",
         include_str!("static/database.js"),
@@ -257,8 +267,29 @@ const STATIC_FILES: &[(&str, &str, &str)] = &[
     ("style.css", "text/css", include_str!("static/style.css")),
 ];
 
-/// ビルドの印（ビルドした日時の UNIX 秒）。画面が古い版のままか見分けるのに使う
-pub const BUILD: &str = env!("MY_TODO_BUILD");
+/// 版の印。.exe に埋め込んだ画面のファイルとバージョンから計算するハッシュ（16 進 8 桁）。
+/// 画面が変われば変わり、同じ版なら起動し直しても変わらない。画面が古い版のままか見分けるのに使う。
+/// （ビルドスクリプトを使わずに、実行時に 1 回だけ計算する）
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        // FNV-1a（64 ビット）。暗号ではなく、変わったかどうかを見分けるためだけ
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        feed(env!("CARGO_PKG_VERSION").as_bytes());
+        feed(INDEX_HTML.as_bytes());
+        for (name, _, body) in STATIC_FILES {
+            feed(name.as_bytes());
+            feed(body.as_bytes());
+        }
+        format!("{:08x}", h >> 32)
+    })
+}
 
 async fn index_html() -> impl IntoResponse {
     (
@@ -267,9 +298,11 @@ async fn index_html() -> impl IntoResponse {
             // 古い画面をブラウザに覚えさせない（アプリを新しくしたら必ず新しい画面になるように）
             (header::CACHE_CONTROL, "no-store"),
         ],
-        include_str!("static/index.html"),
+        INDEX_HTML,
     )
 }
+
+const INDEX_HTML: &str = include_str!("static/index.html");
 
 async fn static_file(Path(file): Path<String>) -> Response {
     match STATIC_FILES.iter().find(|(name, _, _)| *name == file) {
@@ -283,18 +316,4 @@ async fn static_file(Path(file): Path<String>) -> Response {
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-/// ビルドした日時（この PC の時刻で "2026-11-21 12:20"）
-pub fn build_time_text() -> String {
-    BUILD
-        .parse::<i64>()
-        .ok()
-        .and_then(|s| jiff::Timestamp::from_second(s).ok())
-        .map(|t| {
-            t.to_zoned_datetime(jiff::tz::TimeZone::system())
-                .strftime("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_default()
 }

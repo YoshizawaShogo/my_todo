@@ -522,16 +522,19 @@ button.tag_chip { font-size: 12px; line-height: 22px; padding: 0 10px; border-ra
 .bar_handle { position: absolute; top: -3px; bottom: -3px; width: 8px; cursor: ew-resize; }
 .bar_handle.left { left: -3px; }
 .bar_handle.right { right: -3px; }
+/* カーソルを合わせると、両端の内側に短いつまみの線を出す。
+   バーの端（角の丸み）には重ねないので、形も期限切れ・開始遅れの輪郭も変わらない */
 .bar.own:hover .bar_handle::after {
   content: "";
   position: absolute;
-  top: 4px;
-  bottom: 4px;
-  left: 3px;
+  top: 7px;
+  bottom: 7px;
   width: 2px;
   border-radius: 1px;
   background: rgba(255, 255, 255, 0.85);
 }
+.bar.own:hover .bar_handle.left::after { left: 6px; }
+.bar.own:hover .bar_handle.right::after { left: 0; }
 .bar.drag_source { opacity: 0.3; }
 .bar.drag_preview { opacity: 0.85; box-shadow: 0 0 0 2px var(--accent); pointer-events: none; z-index: 1; }
 body.gantt_dragging { user-select: none; }
@@ -840,7 +843,7 @@ body.drag_create, body.drag_create * { cursor: crosshair !important; }
 
 /* ---------- 未分類ペイン ---------- */
 .inbox_section { padding: 6px 0 8px; }
-.inbox_section .section_title .small_button { margin-left: 4px; }
+.inbox_section .section_title .small_button { margin-left: 4px; border-color: var(--border); }
 .inbox_list { max-height: max(200px, calc(90vh - 110px)); overflow-y: auto; padding: 0 0 4px; }
 .inbox_row {
   display: flex;
@@ -876,7 +879,8 @@ body.drag_create, body.drag_create * { cursor: crosshair !important; }
 
 .gantt_header .gantt_name { gap: 6px; }
 .gantt_header .gantt_name .corner_label { font-weight: 600; }
-.gantt_header .gantt_name .small_button { color: var(--muted); }
+.gantt_header .gantt_name .small_button { color: var(--muted); border-color: var(--border); }
+.gantt_header .gantt_name .small_button + .small_button { margin-left: 4px; }
 
 /* ---------- Jira タブ ---------- */
 .jira_section { padding: 8px 0 14px; }
@@ -1195,3 +1199,65 @@ a.jira_key:hover { text-decoration: underline; }
   .top_bar { padding: 10px 16px; }
   .layout { padding: 16px; }
 }
+
+/* ---------- 線表のゴミ箱（バーを運ぶと日程を消す） ---------- */
+.gantt_trash {
+  position: fixed;
+  right: 32px;
+  bottom: 32px;
+  z-index: 30;
+  padding: 18px 22px;
+  border: 2px dashed var(--danger);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--danger);
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+.gantt_trash[hidden] { display: none; }
+.gantt_trash.over { background: var(--danger); color: #fff; transform: scale(1.06); }
+
+/* 切り取り中の行 */
+[data-task_id].cut .label, [data-task_id].cut .title { opacity: 0.45; text-decoration: line-through dashed; }
+
+/* 行（名前）のドラッグはブラウザの drop で受けるので、ゴミ箱がポインタを受け取るようにする */
+.gantt_trash.task_mode { pointer-events: auto; }
+
+/* 本文の小さなボタンで、消す操作 */
+.small_button.danger:hover { color: var(--danger); border-color: var(--danger); }
+
+/* ---------- テンプレート ---------- */
+.template_switch { display: contents; }
+.template_panel {
+  position: fixed;
+  z-index: 40;
+  width: 520px;
+  max-width: calc(100vw - 32px);
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.template_panel[hidden] { display: none; }
+.template_panel #template_list { align-self: stretch; }
+.template_part { align-self: stretch; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.template_part + .template_part { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 6px; }
+.template_heading { margin: 0; font-size: 14px; }
+.template_hint { margin: 0; font-size: 12px; color: var(--muted); }
+.template_start_row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.template_start_row input { width: 140px; }
+.template_items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.template_items li { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 6px; }
+.template_items li:hover { background: rgba(127, 127, 127, 0.08); }
+.template_info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.template_info .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.template_info .meta { font-size: 12px; color: var(--muted); }
+
+/* 工数記録の × がない行も、列をそろえる */
+.work_remove_placeholder { display: inline-block; width: 26px; }

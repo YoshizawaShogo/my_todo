@@ -197,10 +197,19 @@ function work_row(r, minutes, total) {
     el("span", { class: "work_pct" }, total > 0 ? `${pct}%` : ""),
     el("span", { class: "work_min" + (minutes > 0 ? "" : " zero") }, fmt_hours(minutes)),
     el("span", { class: "work_total", title: "このタスクの記録の合計（全期間）" }, t.actual_min ? `累計 ${fmt_hours(t.actual_min)}` : ""),
-    icon_button("×", "この日の振り分けから外す", () => {
-      work.rows = work.rows.filter((x) => x !== r);
-      schedule_save(0);
-    }));
+    // その日の候補（線表で重なる・その日に完了）は、外しても読み直すと割合 0 で戻ってくるので × を出さない。
+    // 割合 0 なら記録には入らない
+    is_day_suggestion(t.id)
+      ? el("span", { class: "work_remove_placeholder" })
+      : icon_button("×", "この日の振り分けから外す", () => {
+        work.rows = work.rows.filter((x) => x !== r);
+        schedule_save(0);
+      }));
+}
+
+/// 線表でその日にバーが重なっている・その日に完了した（記録を消しても候補に出る）タスクか
+function is_day_suggestion(task_id) {
+  return (work.day?.suggestions ?? []).some((s) => s.task_id === task_id && s.always_suggested);
 }
 
 /// スライダーを動かしている間は、行を作り直さずに数字だけ書き換える
