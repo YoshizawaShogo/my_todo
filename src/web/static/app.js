@@ -14,6 +14,7 @@ const state = {
   anchorId: null, // Shift＋クリックの範囲の起点
   dragIds: null, // ドラッグ中のタスク（複数選択ならすべて、画面の並び順）
   dragTag: null, // 絞り込みのタグを運んでいるときのタグ名（タスクへ落とすと付ける）
+  dragTagFrom: null, // タスクに付いているタグを運んでいるときの、そのタスクの id（ゴミ箱で外す）
   tab: load_json("tab", "gantt"), // gantt / list
   collapsed: new Set(load_json("collapsed", [])),
   dragId: null,
@@ -297,16 +298,36 @@ function tag_style(name) {
 }
 
 /// タグのチップ。active(name) が真のものは強調、クリックで onToggle(name)
-function tag_chips(tags, active, onToggle) {
-  return tags.map((name) => el("span", {
-    class: "tag_chip" + (active(name) ? " active" : ""),
-    style: tag_style(name),
-    title: "クリックでこのタグに絞り込む・ダブルクリックでタグの名前を変える（すべてのタスクで）",
-    onclick: (ev) => {
-      ev.stopPropagation();
-      tag_click(name, onToggle);
-    },
-  }, name));
+/// タスクの行に付いているタグ。taskId を渡すと、ドラッグしてゴミ箱に入れるとそのタスクから外せる
+/// （ほかのタスクの行に落とすと、そのタスクにも付く）
+function tag_chips(tags, active, onToggle, taskId = null) {
+  return tags.map((name) => {
+    const chip = el("span", {
+      class: "tag_chip" + (active(name) ? " active" : ""),
+      style: tag_style(name),
+      title: "クリックでこのタグに絞り込む・ダブルクリックでタグの名前を変える（すべてのタスクで）" +
+        (taskId === null ? "" : "・ドラッグしてゴミ箱に入れるとこのタスクから外す"),
+      onclick: (ev) => {
+        ev.stopPropagation();
+        tag_click(name, onToggle);
+      },
+    }, name);
+    if (taskId !== null) {
+      chip.draggable = true;
+      chip.addEventListener("dragstart", (ev) => {
+        ev.stopPropagation(); // 行（名前）のドラッグにしない
+        ev.dataTransfer.setData(TAG_DRAG_TYPE, name);
+        ev.dataTransfer.effectAllowed = "copyMove";
+        state.dragTag = name;
+        state.dragTagFrom = taskId;
+        document.body.classList.add("tag_dragging");
+        const row = chip.closest("[data-task_id]");
+        if (state.tab === "gantt" && row) show_trash("tag", { row: row.getBoundingClientRect(), x: ev.clientX, y: ev.clientY });
+      });
+      chip.addEventListener("dragend", end_tag_drag);
+    }
+    return chip;
+  });
 }
 
 /// タグのクリック：1 回なら絞り込み、すばやく 2 回なら名前の変更。
@@ -416,6 +437,8 @@ function attach_tag_drag(chip, name) {
 }
 
 function end_tag_drag() {
+  if (state.dragTagFrom !== null) show_trash(null);
+  state.dragTagFrom = null;
   state.dragTag = null;
   document.body.classList.remove("tag_dragging");
   document.querySelectorAll(".tag_drop_target").forEach((r) => r.classList.remove("tag_drop_target"));
@@ -425,8 +448,18 @@ function end_tag_drag() {
 /// 名前のドラッグ（並べ替え）の処理より先に受け取って、そちらには渡さない
 function setup_tag_drop() {
   const rowAt = (ev) => (state.dragTag ? ev.target.closest?.("[data-task_id]") : null);
+  const overTrash = (ev) => state.dragTagFrom !== null && ev.target instanceof Element && ev.target.closest("#gantt_trash");
   document.addEventListener("dragover", (ev) => {
     if (!state.dragTag) return;
+    $("gantt_trash").classList.toggle("over", Boolean(overTrash(ev)));
+    if (overTrash(ev)) {
+      // ゴミ箱の上では、下に重なっている行の「ここに付ける」の枠は出さない（外すのか付けるのか迷わないように）
+      document.querySelectorAll(".tag_drop_target").forEach((r) => r.classList.remove("tag_drop_target"));
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.dataTransfer.dropEffect = "move";
+      return;
+    }
     const row = rowAt(ev);
     document.querySelectorAll(".tag_drop_target").forEach((r) => { if (r !== row) r.classList.remove("tag_drop_target"); });
     ev.stopPropagation();
@@ -437,6 +470,20 @@ function setup_tag_drop() {
   }, true);
   document.addEventListener("drop", async (ev) => {
     if (!state.dragTag) return;
+    if (overTrash(ev)) {
+      // タスクに付いているタグをゴミ箱へ：そのタスクから外す（選んでいる行のタグなら、選んでいるタスクすべてから）
+      ev.preventDefault();
+      ev.stopPropagation();
+      const tag = state.dragTag, from = state.dragTagFrom;
+      end_tag_drag();
+      const ids = state.selected.has(from) && state.selected.size > 1
+        ? visible_task_order().filter((x) => state.selected.has(x))
+        : [from];
+      const r = await api("POST", "/tasks/remove_tag", { ids, tag });
+      await reload();
+      toast(`タグ「${tag}」を ${r.changed} 件から外しました（Ctrl+Z で元に戻す）`);
+      return;
+    }
     const tag = state.dragTag;
     const row = rowAt(ev);
     ev.stopPropagation();
@@ -720,17 +767,35 @@ function add_input(pending) {
 }
 
 // ---------- 名前のドラッグ（並べ替え・階層変更） ----------
+/// 行のどこに落とすか：上の 1/3 は前、下の 1/3 は後ろ、真ん中は子にする
 function drop_zone(rowEl, ev) {
   const rect = rowEl.getBoundingClientRect();
   const y = (ev.clientY - rect.top) / rect.height;
-  if (y < 0.25) return "before";
-  if (y > 0.75) return "after";
+  if (y < 1 / 3) return "before";
+  if (y > 2 / 3) return "after";
   return "into";
+}
+
+let dropMark = { el: null, cls: null }; // いま印を付けている行と印（同じなら付け直さない＝ちらつかない）
+
+function set_drop_mark(el, cls) {
+  if (dropMark.el === el && dropMark.cls === cls) return;
+  clear_drop_marks();
+  if (el) el.classList.add(cls);
+  dropMark = { el, cls };
 }
 
 function clear_drop_marks() {
   document.querySelectorAll(".drop_before, .drop_after, .drop_into").forEach((e) =>
     e.classList.remove("drop_before", "drop_after", "drop_into"));
+  dropMark = { el: null, cls: null };
+}
+
+/// 開いている親の「下」に落としたときは、線が親と最初の子の間に出るので、その見た目どおり最初の子の前に入れる
+function resolve_drop(task, zone) {
+  if (zone !== "after" || state.collapsed.has(task.id)) return { zone, refId: task.id };
+  const kids = children_of(task.id).filter((c) => state.tab !== "gantt" || gantt_visible(c));
+  return kids.length ? { zone: "before", refId: kids[0].id } : { zone, refId: task.id };
 }
 
 /// ドラッグしているタスク（のどれか）の上や子孫の上には落とせない
@@ -749,6 +814,8 @@ async function move_many(ids, placement) {
 function attach_tree_drag(handle, rowEl, task) {
   handle.draggable = true;
   handle.addEventListener("dragstart", (ev) => {
+    // 選んでいない行をつかんだら、その行を選ぶ（前に選んでいた行が選ばれたままに見えないように）
+    if (!is_selected(task.id)) select(task.id);
     // 選んでいる行をつかんだら、選んでいるものをすべて（画面の並び順で）動かす
     const ids = is_selected(task.id) && state.selected.size > 1
       ? visible_task_order().filter((id) => state.selected.has(id))
@@ -771,28 +838,29 @@ function attach_tree_drag(handle, rowEl, task) {
     clear_drop_marks();
     show_trash(null);
   });
+  // 行の中の名前・チェック・タグなどの間を動くたびに印を消して付け直すとちらつくので、
+  // dragleave では消さず、ほかの行に移ったとき・行の外に出たとき（setup の dragover）に消す
   rowEl.addEventListener("dragover", (ev) => {
     if (state.dragId === null || dragging_onto_self(task.id)) return;
     ev.preventDefault();
-    clear_drop_marks();
-    rowEl.classList.add("drop_" + drop_zone(rowEl, ev));
+    set_drop_mark(rowEl, "drop_" + drop_zone(rowEl, ev));
   });
-  rowEl.addEventListener("dragleave", () => rowEl.classList.remove("drop_before", "drop_after", "drop_into"));
   rowEl.addEventListener("drop", async (ev) => {
     ev.preventDefault();
     const id = state.dragId;
     const ids = state.dragIds || [id];
     clear_drop_marks();
     if (id === null || dragging_onto_self(task.id)) return;
-    const zone = drop_zone(rowEl, ev);
+    const { zone, refId } = resolve_drop(task, drop_zone(rowEl, ev));
+    if (zone !== "into" && dragging_onto_self(refId)) return;
     if (ids.length > 1) {
       if (zone === "into") expand(task.id);
-      await move_many(ids, zone === "into" ? { kind: "into", parent_id: task.id, inbox: false } : { kind: zone, ref_id: task.id });
+      await move_many(ids, zone === "into" ? { kind: "into", parent_id: task.id, inbox: false } : { kind: zone, ref_id: refId });
     } else if (zone === "into") {
       expand(task.id);
       await move(id, task.id, null);
     } else {
-      await move_relative(id, task.id, zone);
+      await move_relative(id, refId, zone);
     }
   });
 }
@@ -802,10 +870,8 @@ function attach_group_drop(rowEl, key) {
   rowEl.addEventListener("dragover", (ev) => {
     if (state.dragId === null) return;
     ev.preventDefault();
-    clear_drop_marks();
-    rowEl.classList.add("drop_into");
+    set_drop_mark(rowEl, "drop_into");
   });
-  rowEl.addEventListener("dragleave", () => rowEl.classList.remove("drop_into"));
   rowEl.addEventListener("drop", async (ev) => {
     ev.preventDefault();
     clear_drop_marks();
@@ -987,13 +1053,9 @@ function render_detail() {
     .filter((t) => !task.tags.some((n) => same_tag(n, t.name)))
     .map((t) => el("option", { value: t.name })));
 
-  const meta = [`登録: ${fmt(task.created_at)}`];
-  if (task.started_at) meta.push(`着手: ${fmt(task.started_at)}`);
-  if (task.completed_at) meta.push(`完了: ${fmt(task.completed_at)}`);
+  // 場所だけを出す（作った日・着手・完了は「変更の履歴」に出るので、ここでは重ねない）
   const path = path_titles(task);
-  if (path.length) meta.unshift(`場所: ${path.join(" › ")}`);
-  else meta.unshift(`場所: ${task.is_inbox ? "未分類" : "タスク"}`);
-  $("detail_meta").textContent = meta.join("\n");
+  $("detail_meta").textContent = `場所：${path.length ? path.join(" › ") : task.is_inbox ? "未分類" : "線表の最上位"}`;
   renderedDetailId = task.id;
 
   const key = `${task.id}@${reloadCount}`;
@@ -1006,9 +1068,15 @@ function render_detail() {
 async function load_history(id, key) {
   const events = await api("GET", `/tasks/${id}/events`);
   if (historyKey !== key) return; // 取得中に別のタスクへ切り替わった
+  const list = events.reverse(); // 新しい順
   $("detail_history").replaceChildren(
-    ...events.reverse().map((e) => el("li", {}, el("time", {}, fmt(e.at)), describe_event(e))),
+    ...list.map((e) => el("li", {}, el("time", {}, fmt(e.at)), describe_event(e))),
   );
+  // 閉じたままでも、最後にいつ何をしたかがわかるように見出しに出す
+  const last = list[0];
+  $("detail_history_summary").textContent = last
+    ? `変更の履歴（${list.length} 件。最後：${fmt(last.at)} ${describe_event(last)}）`
+    : "変更の履歴";
 }
 
 function describe_event(e) {
@@ -1018,9 +1086,9 @@ function describe_event(e) {
     : n === null ? `${label}を取り消し（${conv(o)}）`
     : `${label}を変更: ${conv(o)} → ${conv(n)}`;
   switch (e.kind) {
-    case "created": return "登録";
-    case "title": return `タイトル: ${o} → ${n}`;
-    case "status": return `${STATUS_LABEL[o] ?? o} → ${STATUS_LABEL[n] ?? n}`;
+    case "created": return "作成";
+    case "title": return `タイトルを変更: ${o} → ${n}`;
+    case "status": return `状態を変更: ${STATUS_LABEL[o] ?? o} → ${STATUS_LABEL[n] ?? n}`;
     case "planned_start": return change("開始予定日", short_date);
     case "planned_end": return change("終了予定日", short_date);
     case "next_action": return change("次の予定", (v) => v.replace(/^\d{4}-\d{2}-\d{2}/, short_date));
@@ -1251,6 +1319,10 @@ function setup() {
   setup_clipboard();
   setup_templates();
   setup_tag_drop();
+  // 落とし先（行・見出し）の外に出たら、前後の線や枠の印を消す
+  document.addEventListener("dragover", (ev) => {
+    if (dropMark.el && !(ev.target instanceof Element && ev.target.closest("[data-task_id], .gantt_header .gantt_name, #inbox_header"))) clear_drop_marks();
+  });
   // 画面を閉じたらアプリに知らせる（ほかに開いている画面がなければ、1 分ほどでアプリが終わる）
   window.addEventListener("pagehide", () => { navigator.sendBeacon("/api/bye"); });
   load_jira_config().then(() => render_detail());

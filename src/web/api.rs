@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/tasks/delete_many", post(delete_tasks))
         .route("/tasks/add_tag", post(add_tag))
         .route("/tags/rename", post(rename_tag))
+        .route("/tasks/remove_tag", post(remove_tag))
         .route("/tasks/create_many", post(create_tasks))
         .route("/tasks/{id}/events", get(list_events))
         .route("/tasks/{id}/links", post(add_link))
@@ -688,6 +689,17 @@ async fn add_tag(State(s): State<AppState>, Json(req): Json<AddTag>) -> ApiResul
     let label = format!("タグ「{}」を {} 件に追加", req.tag.trim(), req.ids.len());
     with_conn(&s, |c| {
         undo_service::record(c, &label, |c| task_service::add_tag(c, &req.ids, &req.tag))
+    })
+    .map(|changed| Json(AddTagResult { changed }))
+}
+
+/// 複数のタスクからタグを 1 つ外す（タスクのタグをゴミ箱へドラッグしたとき。1 回の操作として元に戻せる）
+async fn remove_tag(State(s): State<AppState>, Json(req): Json<AddTag>) -> ApiResult<AddTagResult> {
+    let label = format!("タグ「{}」を {} 件から外す", req.tag.trim(), req.ids.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            task_service::remove_tag(c, &req.ids, &req.tag)
+        })
     })
     .map(|changed| Json(AddTagResult { changed }))
 }

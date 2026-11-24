@@ -833,6 +833,36 @@ pub fn move_tasks(
     Ok(moved)
 }
 
+/// 複数のタスクからタグを 1 つ外す（付いていないものはそのまま）。タグが変わった件数を返す
+pub fn remove_tag(conn: &Connection, ids: &[i64], name: &str) -> ServiceResult<usize> {
+    let key = name.trim().trim_start_matches('#').trim().to_lowercase();
+    let tx = Tx::begin(conn)?;
+    let mut changed = 0;
+    for &id in ids {
+        let task = get_task(&tx, id)?;
+        let tags: Vec<String> = task
+            .tags
+            .iter()
+            .filter(|t| t.to_lowercase() != key)
+            .cloned()
+            .collect();
+        if tags.len() == task.tags.len() {
+            continue;
+        }
+        update_task(
+            &tx,
+            id,
+            TaskPatch {
+                tags: Some(tags),
+                ..Default::default()
+            },
+        )?;
+        changed += 1;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// タグの名前を変える（付いているすべてのタスクで変わる）。新しい名前のタグがすでにあれば、そちらにまとめる。
 /// 名前が変わったタスクの数を返す
 pub fn rename_tag(conn: &Connection, from: &str, to: &str) -> ServiceResult<usize> {
@@ -949,6 +979,27 @@ pub fn delete_task(conn: &Connection, id: i64) -> ServiceResult<()> {
 mod tests {
     use super::*;
     use crate::db;
+
+    #[test]
+    fn remove_tag_from_many() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let b = add(&conn, "B", None);
+        for id in [a.id, b.id] {
+            update_task(
+                &conn,
+                id,
+                TaskPatch {
+                    tags: Some(vec!["急ぎ".into(), "残す".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(remove_tag(&conn, &[a.id, b.id], "#急ぎ").unwrap(), 2);
+        assert_eq!(get_task(&conn, a.id).unwrap().tags, ["残す"]);
+        assert_eq!(remove_tag(&conn, &[a.id], "急ぎ").unwrap(), 0);
+    }
 
     #[test]
     fn rename_tag_everywhere_and_merge() {

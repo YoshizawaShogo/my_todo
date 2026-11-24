@@ -14,6 +14,8 @@
   --text: #1f2328;
   --muted: #6a737d;
   --border: #d8dee4;
+  --row_line: #edf0f3; /* 行の区切り（タスクを 1 件ずつの枠に見せる） */
+  --frame: #b9c2cc; /* 線表・未分類の表の外枠（行の区切りより濃く） */
   --accent: #2f6fde;
   --accent_soft: #e5eefc;
   --doing: #b76e00;
@@ -37,6 +39,8 @@
     --text: #e6e8eb;
     --muted: #9aa3ad;
     --border: #343a42;
+    --row_line: #262c33;
+    --frame: #4a525c;
     --accent: #6ea0ff;
     --accent_soft: #233452;
     --doing: #e0a040;
@@ -465,7 +469,8 @@ button.tag_chip { font-size: 12px; line-height: 22px; padding: 0 10px; border-ra
 .gantt_track { position: relative; flex: none; overflow: hidden; cursor: pointer; }
 .gantt_header { position: sticky; top: 0; z-index: 3; display: flex; background: var(--panel); border-bottom: 1px solid var(--border); }
 .gantt_header .gantt_name { z-index: 4; height: 40px; font-size: 12px; color: var(--muted); padding-left: 12px; cursor: default; }
-.gantt_days { position: relative; flex: none; height: 40px; }
+/* 月の名前などが右端からはみ出して、横のスクロールバーが出ないよう切る */
+.gantt_days { position: relative; flex: none; height: 40px; overflow: hidden; }
 .gantt_day {
   position: absolute;
   top: 0;
@@ -481,7 +486,7 @@ button.tag_chip { font-size: 12px; line-height: 22px; padding: 0 10px; border-ra
 .gantt_day.weekend .dnum { color: var(--danger); opacity: 0.7; }
 .gantt_day.today .dnum { color: #fff; background: var(--accent); border-radius: 9px; margin: 0 3px; }
 
-.gantt_bg { position: absolute; top: 40px; bottom: 0; pointer-events: none; z-index: 0; }
+.gantt_bg { position: absolute; top: 40px; bottom: 0; pointer-events: none; z-index: 0; overflow: hidden; }
 .gantt_bg .weekend { position: absolute; top: 0; bottom: 0; background: var(--weekend); }
 .gantt_bg .week_line { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border); opacity: 0.6; }
 .gantt_bg .today_line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); opacity: 0.7; }
@@ -1339,3 +1344,22 @@ body.tag_dragging .tag_chip { cursor: copy; }
 
 /* 薄いお知らせ（Ctrl+S を押したときの「自動で保存しています」） */
 .toast.faint { opacity: 0.7; font-size: 12px; }
+
+/* ---------- 行を 1 件ずつの枠に見せる（外枠は濃く） ---------- */
+.gantt_scroll { border-color: var(--frame); }
+.gantt_row { box-sizing: border-box; border-bottom: 1px solid var(--row_line); }
+.inbox_list { margin: 0 24px; padding: 0; border: 1px solid var(--frame); border-radius: 6px; }
+.inbox_row { border-bottom: 1px solid var(--row_line); }
+.inbox_row:last-child { border-bottom: none; }
+
+/* タグを運んでいるときの落とし先：線表の行は名前の欄が上に重なるので、行全体の上に枠を描く */
+.gantt_row.tag_drop_target { outline: none; }
+.gantt_row.tag_drop_target .gantt_name, .gantt_row.tag_drop_target .gantt_track { background-color: var(--accent_soft); }
+.gantt_row.tag_drop_target::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+  z-index: 6;
+}

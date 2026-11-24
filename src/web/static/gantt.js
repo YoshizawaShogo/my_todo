@@ -3,10 +3,10 @@
 
 // 表示の縮尺。step は「前へ」「次へ」で動く日数、days_every は日付の数字を出す間隔（0 なら出さず月だけ）
 const GANTT_SCALES = {
-  weeks: { label: "6 週間", dayW: 12, days: 42, step: 7, stepText: "週", back: 7, days_every: "day", fit: true },
+  weeks: { label: "6 週間", dayW: 6, days: 42, step: 7, stepText: "週", back: 7, days_every: "day", fit: true },
   // どの縮尺も、横にスクロールしなくても全体が見えるよう、線表の幅に合わせて 1 日の幅を決める（dayW は最小値）
-  quarter: { label: "3 か月", dayW: 4, days: 98, step: 28, stepText: "4 週", back: 14, days_every: "monday", fit: true },
-  year: { label: "1 年", dayW: 1.5, days: 371, step: 91, stepText: "3 か月", back: 28, days_every: "none", fit: true },
+  quarter: { label: "3 か月", dayW: 2, days: 98, step: 28, stepText: "4 週", back: 14, days_every: "monday", fit: true },
+  year: { label: "1 年", dayW: 0.8, days: 371, step: 91, stepText: "3 か月", back: 28, days_every: "none", fit: true },
 };
 let GANTT_DAY_W = 28; // 1 日の幅（px）。縮尺で変わる
 let GANTT_DAYS = 42; // 表示する日数。縮尺で変わる
@@ -174,8 +174,9 @@ function show_trash(kind, from = null) {
   t.classList.toggle("task_mode", kind === "task");
   t.removeAttribute("style");
   if (kind === "bar") t.textContent = "🗑️ ここに入れると日程を消す";
-  if (kind === "task") {
-    t.textContent = "🗑️ ここに入れるとタスクを削除";
+  if (kind === "task" || kind === "tag") {
+    t.textContent = kind === "task" ? "🗑️ ここに入れるとタスクを削除" : "🗑️ ここに入れるとタグを外す";
+    t.classList.add("task_mode"); // HTML5 のドラッグを受け取る
     if (from) place_task_trash(t, from);
   }
 }
@@ -184,7 +185,7 @@ function show_trash(kind, from = null) {
 /// つかんだ所のすぐ横に出すと、少し動かしただけで誤って入れてしまうので、マウスから 100px 以上離す。
 /// 線表の中の行なら、時間軸の側（名前の欄の右）に出して名前の上には重ねない
 function place_task_trash(t, { row, x, y }) {
-  const W = 180, H = 64, GAP = 100, MARGIN = 12;
+  const W = 210, H = 64, GAP = 100, MARGIN = 12;
   const box = $("gantt").getBoundingClientRect();
   const inGantt = y >= box.top && y <= box.bottom && x >= box.left && x <= box.right;
   const nameW = parseFloat(getComputedStyle($("gantt")).getPropertyValue("--gantt_name_w")) || 0;
@@ -330,8 +331,8 @@ function fit_gantt_day_width() {
   if (!sc.fit) return;
   const box = $("gantt");
   const nameW = parseFloat(getComputedStyle(box).getPropertyValue("--gantt_name_w")) || 0;
-  // 端の ◆・▶ やバーのつまみが少しはみ出すので、その分の余白を残す
-  const avail = box.clientWidth - nameW - 10;
+  // 時間軸の中身ははみ出しを切っているので、枠線の分だけ残す
+  const avail = box.clientWidth - nameW - 2;
   GANTT_DAY_W = Math.max(sc.dayW, Math.floor((avail / GANTT_DAYS) * 100) / 100);
 }
 
@@ -477,7 +478,7 @@ function inbox_row(t, depth, hasKids) {
   row.append(twisty, check, label,
     ...pinned_note(t),
     ...link_mark(t),
-    ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag),
+    ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     ...(dates.length ? [el("span", { class: "date_chip" }, dates.join(" "))] : []),
     el("span", { class: "row_actions" },
       icon_button("➕", "子タスクを追加", () => begin_add(t.id), "emoji"),
@@ -524,7 +525,7 @@ function gantt_row(r, ctx) {
     twisty, check, label,
     ...pinned_note(t),
     ...link_mark(t),
-    ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag),
+    ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     el("span", { class: "row_actions" },
       icon_button("➕", "子タスクを追加", () => begin_add(t.id), "emoji"),
       icon_button("🗑️", "このタスクを削除（子も一緒に消えます）", () => remove(t.id), "emoji danger")));
