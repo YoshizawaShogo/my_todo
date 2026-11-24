@@ -294,7 +294,9 @@ function setup_jira() {
     if (!confirm(`次の ${pending.length} 件を Jira に送ります。\n\n${summary}`)) return;
     $("jira_send").disabled = true;
     try {
-      jira.results = await api("POST", "/jira/send", { from: JIRA_ALL_FROM, to: JIRA_ALL_TO });
+      // 確認した内容も送り、サーバーで作り直した内容と食い違ったら送らない（その場合は下書きを読み直す）
+      const expected = pending.map((l) => ({ work_date: l.work_date, issue_key: l.issue_key, action: l.action, minutes: l.minutes }));
+      jira.results = await api("POST", "/jira/send", { from: JIRA_ALL_FROM, to: JIRA_ALL_TO, expected });
       const failed = jira.results.filter((r) => r.error).length;
       toast(failed ? `${jira.results.length - failed} 件送信、${failed} 件失敗しました` : `✅ ${jira.results.length} 件を Jira に送信しました`, failed ? "error" : "info");
     } finally {

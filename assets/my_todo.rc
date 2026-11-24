@@ -1,0 +1,2 @@
+// exe のアイコン（scripts/make_icon.py が windres でこのファイルから my_todo.res を作る）
+1 ICON "my_todo.ico"

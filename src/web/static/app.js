@@ -13,6 +13,7 @@ const state = {
   selected: new Set(), // 選んでいるタスク（Shift・Ctrl＋クリックで複数）
   anchorId: null, // Shift＋クリックの範囲の起点
   dragIds: null, // ドラッグ中のタスク（複数選択ならすべて、画面の並び順）
+  dragTag: null, // 絞り込みのタグを運んでいるときのタグ名（タスクへ落とすと付ける）
   tab: load_json("tab", "gantt"), // gantt / list
   collapsed: new Set(load_json("collapsed", [])),
   dragId: null,
@@ -93,6 +94,7 @@ async function reload() {
   refresh_unrecorded().catch(() => {});
   if (state.selectedId !== null && !state.byId.has(state.selectedId)) state.selectedId = null;
   state.selected = new Set([...state.selected].filter((id) => state.byId.has(id)));
+  prune_tag_filters();
   render();
 }
 
@@ -182,7 +184,13 @@ async function move_relative(id, refId, where) {
 /// key は親の id か "root"（タスク）/ "inbox"（未分類）
 async function create(title, key) {
   const body = typeof key === "number" ? { title, parent_id: key } : { title, inbox: key !== "root" };
-  return api("POST", "/tasks", body);
+  const task = await api("POST", "/tasks", body);
+  // 線表で絞り込み中に追加したものが条件に合わなくても、見えなくならないように出し続ける
+  if (gantt_filter_active() && !gantt_matches(task)) {
+    gantt.pinned.add(task.id);
+    toast(`「${task.title}」は絞り込みの条件に合いませんが、追加したので表示しています（絞り込みを変えると見えなくなります）`);
+  }
+  return task;
 }
 
 async function update(id, patch) {
@@ -293,25 +301,242 @@ function tag_chips(tags, active, onToggle) {
   return tags.map((name) => el("span", {
     class: "tag_chip" + (active(name) ? " active" : ""),
     style: tag_style(name),
-    title: "クリックでこのタグに絞り込む",
+    title: "クリックでこのタグに絞り込む・ダブルクリックでタグの名前を変える（すべてのタスクで）",
     onclick: (ev) => {
       ev.stopPropagation();
-      onToggle(name);
+      tag_click(name, onToggle);
     },
   }, name));
 }
 
-/// タグの絞り込みボタン（件数付き）
-function tag_filter_buttons(selected, onToggle) {
-  return state.tags.map((t) => {
-    const on = selected.some((n) => same_tag(n, t.name));
-    return el("button", {
-      type: "button",
-      class: "tag_chip" + (on ? " active" : ""),
-      style: tag_style(t.name),
-      onclick: () => onToggle(t.name),
-    }, t.name, el("span", { class: "count" }, String(t.count)));
+/// タグのクリック：1 回なら絞り込み、すばやく 2 回なら名前の変更。
+/// 1 回目ですぐ絞り込むと行が描き直されて 2 回目が別の所に当たるので、少し待ってから絞り込む
+const TAG_DBLCLICK_MS = 250;
+let tagClick = { name: null, timer: 0 };
+function tag_click(name, onToggle) {
+  if (tagClick.name === name && tagClick.timer) {
+    clearTimeout(tagClick.timer);
+    tagClick = { name: null, timer: 0 };
+    rename_tag(name);
+    return;
+  }
+  clearTimeout(tagClick.timer);
+  tagClick = {
+    name,
+    timer: setTimeout(() => {
+      tagClick = { name: null, timer: 0 };
+      onToggle(name);
+    }, TAG_DBLCLICK_MS),
+  };
+}
+
+/// タグの名前を変える（付いているすべてのタスクで。同じ名前のタグがあればまとめる）
+async function rename_tag(name) {
+  const to = prompt(`タグ「${name}」の新しい名前（付いているすべてのタスクで変わります。すでにある名前ならまとめます）`, name);
+  if (to === null || !to.trim() || to.trim() === name) return;
+  const r = await api("POST", "/tags/rename", { from: name, to });
+  // 絞り込みで選んでいたら、新しい名前に置き換える
+  for (const f of [gantt.filter, list.filter]) {
+    if (f.tags.some((n) => same_tag(n, name))) {
+      f.tags = f.tags.filter((n) => !same_tag(n, name) && !same_tag(n, to.trim()));
+      f.tags.push(to.trim().replace(/^#/, ""));
+    }
+  }
+  save_json("gantt_filter", gantt.filter);
+  save_json("list_filter", list.filter);
+  await reload();
+  toast(`タグ「${name}」を「${to.trim()}」に変えました（${r.changed} 件。Ctrl+Z で元に戻す）`);
+}
+
+/// F2：選んでいるものの名前を変える（タグにフォーカスがあればタグ、関連資料ならその名前、それ以外は選んでいるタスク）
+function rename_by_f2() {
+  const focused = document.activeElement;
+  const tagName = focused?.dataset?.tag_name;
+  if (tagName) return rename_tag(tagName);
+  if (focused?.classList?.contains("link_title")) {
+    focused.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    return;
+  }
+  const id = state.selectedId;
+  const task = id === null ? null : state.byId.get(id);
+  if (!task) return;
+  const label = document.querySelector(`#view_${state.tab} [data-task_id="${id}"] .label, #view_${state.tab} [data-task_id="${id}"] .title`);
+  if (label) start_inline_edit(label, task);
+  else {
+    $("detail_title").focus();
+    $("detail_title").select();
+  }
+}
+
+/// 絞り込みに直接並べるタグの数（多く使われている順）。残りは「ほかのタグ」から選ぶ
+const TAG_FILTER_SHOW = 8;
+
+/// 関連資料があるタスクの印（🔗、2 件以上なら件数）。押すと 1 件ならそのリンクを開き、2 件以上なら詳細を開く
+function link_mark(t) {
+  if (!t.links?.length) return [];
+  const n = t.links.length;
+  return [el("span", {
+    class: "link_mark",
+    title: "関連資料：\n" + t.links.map((l) => `・${l.title}`).join("\n") + (n === 1 ? "\n（クリックで開く）" : "\n（クリックで詳細に一覧）"),
+    onclick: (ev) => {
+      ev.stopPropagation();
+      if (n === 1) window.open(t.links[0].url, "_blank", "noopener,noreferrer");
+      else select(t.id, ev);
+    },
+  }, n === 1 ? "🔗" : `🔗${n}`)];
+}
+
+function tag_filter_chip(t, selected, onToggle) {
+  const on = selected.some((n) => same_tag(n, t.name));
+  const chip = el("button", {
+    type: "button",
+    class: "tag_chip" + (on ? " active" : ""),
+    style: tag_style(t.name),
+    draggable: "true",
+    title: "クリックで絞り込み・タスクの行へドラッグでそのタグを付ける・ダブルクリック（か F2）でタグの名前を変える",
+    "data-tag_name": t.name,
+    onclick: () => tag_click(t.name, onToggle),
+  }, t.name, el("span", { class: "count" }, String(t.count)));
+  attach_tag_drag(chip, t.name);
+  return chip;
+}
+
+// ---------- タグをタスクへドラッグして付ける ----------
+const TAG_DRAG_TYPE = "application/x-my-todo-tag";
+
+function attach_tag_drag(chip, name) {
+  chip.addEventListener("dragstart", (ev) => {
+    ev.dataTransfer.setData(TAG_DRAG_TYPE, name);
+    ev.dataTransfer.effectAllowed = "copy";
+    state.dragTag = name;
+    document.body.classList.add("tag_dragging");
+    close_tag_picker();
   });
+  chip.addEventListener("dragend", end_tag_drag);
+}
+
+function end_tag_drag() {
+  state.dragTag = null;
+  document.body.classList.remove("tag_dragging");
+  document.querySelectorAll(".tag_drop_target").forEach((r) => r.classList.remove("tag_drop_target"));
+}
+
+/// タグを運んでいる間は、タスクの行（線表・未分類・詳細・工数記録）を落とし先にする。
+/// 名前のドラッグ（並べ替え）の処理より先に受け取って、そちらには渡さない
+function setup_tag_drop() {
+  const rowAt = (ev) => (state.dragTag ? ev.target.closest?.("[data-task_id]") : null);
+  document.addEventListener("dragover", (ev) => {
+    if (!state.dragTag) return;
+    const row = rowAt(ev);
+    document.querySelectorAll(".tag_drop_target").forEach((r) => { if (r !== row) r.classList.remove("tag_drop_target"); });
+    ev.stopPropagation();
+    if (!row) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+    row.classList.add("tag_drop_target");
+  }, true);
+  document.addEventListener("drop", async (ev) => {
+    if (!state.dragTag) return;
+    const tag = state.dragTag;
+    const row = rowAt(ev);
+    ev.stopPropagation();
+    end_tag_drag();
+    if (!row) return;
+    ev.preventDefault();
+    const id = Number(row.dataset.task_id);
+    // 選んでいる行に落としたら、選んでいるタスクすべてに付ける
+    const ids = state.selected.has(id) && state.selected.size > 1
+      ? visible_task_order().filter((x) => state.selected.has(x))
+      : [id];
+    const r = await api("POST", "/tasks/add_tag", { ids, tag });
+    await reload();
+    toast(r.changed
+      ? `タグ「${tag}」を ${r.changed} 件に付けました（Ctrl+Z で元に戻す）`
+      : `タグ「${tag}」はもう付いています`);
+  }, true);
+}
+
+/// タグの絞り込みボタン（件数付き）。よく使うタグを並べ、選んでいるタグは必ず出す。
+/// 並びきらない分は「ほかのタグ」で、名前で探して選べる
+/// getSelected は最新の選択（配列）を返す関数（絞り込みの条件オブジェクトは差し替わることがあるため）
+function tag_filter_buttons(getSelected, onToggle) {
+  const selected = getSelected();
+  const byUse = [...state.tags].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "ja"));
+  const shown = byUse.filter((t, i) => i < TAG_FILTER_SHOW || selected.some((n) => same_tag(n, t.name)));
+  const rest = state.tags.length - shown.length;
+  const chips = shown.map((t) => tag_filter_chip(t, selected, onToggle));
+  if (state.tags.length > TAG_FILTER_SHOW) {
+    chips.push(el("button", {
+      type: "button",
+      class: "chip tag_more",
+      title: "すべてのタグから名前で探して選ぶ",
+      onclick: (ev) => { ev.stopPropagation(); open_tag_picker(ev.currentTarget, getSelected, onToggle); },
+    }, rest > 0 ? `ほかのタグ（${rest}）…` : "タグを探す…"));
+  }
+  return chips;
+}
+
+// ---------- タグを探して選ぶ小窓 ----------
+const tagPicker = { el: null, getSelected: null, onToggle: null };
+
+function open_tag_picker(anchor, getSelected, onToggle) {
+  if (!tagPicker.el) {
+    tagPicker.el = el("div", { class: "tag_picker", hidden: true });
+    tagPicker.el.addEventListener("click", (ev) => ev.stopPropagation());
+    document.body.append(tagPicker.el);
+    document.addEventListener("click", close_tag_picker);
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") close_tag_picker(); });
+  }
+  tagPicker.getSelected = getSelected;
+  tagPicker.onToggle = onToggle;
+  const input = el("input", { type: "search", class: "tag_picker_search", placeholder: "タグの名前で探す", autocomplete: "off" });
+  const listEl = el("div", { class: "tag_picker_list" });
+  input.addEventListener("input", () => draw_tag_picker_list(input, listEl));
+  input.addEventListener("keydown", (ev) => {
+    // Enter で、探した結果の先頭を選ぶ
+    if (ev.key === "Enter" && !ev.isComposing) listEl.querySelector("button")?.click();
+  });
+  tagPicker.el.replaceChildren(input, listEl);
+  draw_tag_picker_list(input, listEl);
+  tagPicker.el.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  tagPicker.el.style.top = `${Math.min(r.bottom + 4, window.innerHeight - 340)}px`;
+  tagPicker.el.style.left = `${Math.max(16, Math.min(r.left, window.innerWidth - tagPicker.el.offsetWidth - 16))}px`;
+  input.focus();
+}
+
+function draw_tag_picker_list(input, listEl) {
+  const q = input.value.trim().toLowerCase().replace(/^#/, "");
+  const selected = tagPicker.getSelected();
+  const hits = state.tags.filter((t) => !q || t.name.toLowerCase().includes(q));
+  listEl.replaceChildren(...(hits.length
+    ? hits.map((t) => {
+      const chip = tag_filter_chip(t, selected, (name) => {
+        tagPicker.onToggle(name);
+        draw_tag_picker_list(input, listEl); // 選んだ状態を描き直す（小窓は開いたまま）
+      });
+      return chip;
+    })
+    : [el("p", { class: "empty_hint" }, "そのタグはありません")]));
+}
+
+function close_tag_picker() {
+  if (tagPicker.el) tagPicker.el.hidden = true;
+}
+
+/// 絞り込みで選んでいるタグのうち、もうどのタスクにも付いていないものを外す
+/// （外さないと、ボタンは消えたのに絞り込みだけ残り、タスクが全部隠れてしまう）
+function prune_tag_filters() {
+  const exists = (n) => state.tags.some((t) => same_tag(t.name, n));
+  const prune = (f, save) => {
+    const kept = f.tags.filter(exists);
+    if (kept.length !== f.tags.length) {
+      f.tags = kept;
+      save();
+    }
+  };
+  prune(gantt.filter, save_gantt_filter);
+  prune(list.filter, save_list_filter);
 }
 
 function toggle_in(list, name) {
@@ -410,13 +635,19 @@ function render() {
     b.setAttribute("aria-selected", active);
   }
   for (const name of TABS) $("view_" + name).hidden = state.tab !== name;
-  render_alerts();
-  if (state.tab === "gantt") render_gantt();
-  else if (state.tab === "list") render_list();
-  else if (state.tab === "work") render_work();
-  else if (state.tab === "jira") render_jira();
-  else render_help();
-  mark_cut_rows();
+  // タブの描画で例外が起きても、詳細パネル（選択の解除・消したタスクを閉じる）は必ず描き直す
+  try {
+    render_alerts();
+    if (state.tab === "gantt") render_gantt();
+    else if (state.tab === "list") render_list();
+    else if (state.tab === "work") render_work();
+    else if (state.tab === "jira") render_jira();
+    else render_help();
+    mark_cut_rows();
+  } catch (e) {
+    console.error(e);
+    toast(`画面の描画でエラーが起きました：${e.message}`, "error");
+  }
   render_detail();
 }
 
@@ -432,11 +663,11 @@ function switch_tab(tab) {
 }
 
 // ---------- 連続追加 ----------
-let pendingAdd = null; // { key }：親の id / "root" / "inbox"
+let pendingAdd = null; // { key, draft }：親の id / "root" / "inbox" と、打ちかけの文字
 
 function begin_add(key) {
   if (state.tab !== "gantt") switch_tab("gantt");
-  pendingAdd = { key };
+  pendingAdd = { key, draft: "" };
   if (typeof key === "number") expand(key);
   render();
   // 表示した直後から打ち込めるように、すぐにフォーカスする
@@ -453,6 +684,10 @@ function add_input(pending) {
     placeholder: "名前を入力して Enter（続けて追加 / Esc で終了）",
     "data-pending_add": true,
   });
+  // 描き直し（追加のあとの読み直し・別の画面から戻ったときの読み直し）で欄が作り直されても、
+  // 打ちかけの文字を引き継ぐ
+  input.value = pending.draft || "";
+  input.addEventListener("input", () => { pending.draft = input.value; });
   input.addEventListener("keydown", async (ev) => {
     if (ev.key === "Escape") {
       pendingAdd = null;
@@ -461,9 +696,14 @@ function add_input(pending) {
       const title = input.value.trim();
       if (!title) return;
       input.value = "";
+      pending.draft = "";
       await create(title, pending.key);
       await reload();
-      document.querySelector("[data-pending_add]")?.focus();
+      const next = document.querySelector("[data-pending_add]");
+      if (next && document.activeElement !== next) {
+        next.focus();
+        next.setSelectionRange(next.value.length, next.value.length);
+      }
     }
   });
   input.addEventListener("blur", () => {
@@ -517,7 +757,7 @@ function attach_tree_drag(handle, rowEl, task) {
     state.dragIds = ids;
     ev.dataTransfer.effectAllowed = "move";
     ev.dataTransfer.setData("text/plain", ids.join(","));
-    show_trash("task");
+    show_trash("task", { row: handle.getBoundingClientRect(), x: ev.clientX, y: ev.clientY });
     if (ids.length > 1) {
       const ghost = el("div", { class: "drag_ghost" }, `${ids.length} 件を移動`);
       document.body.append(ghost);
@@ -623,11 +863,66 @@ function apply_selection_classes() {
 let renderedDetailId = null;
 let historyKey = null; // 履歴を取り直すかの判定用（id と再読み込みの回数）
 
+let detailMoreTab = null; // 「その他」の開閉を最後に決めたときのタブ
+
+/// 関連資料の一覧。名前をクリックで開く（新しいタブ）、ダブルクリックで名前を変える、× で外す
+function render_detail_links(task) {
+  const listEl = $("detail_links");
+  // 名前の変更中は描き直さない
+  if (listEl.querySelector("input")) return;
+  listEl.replaceChildren(...task.links.map((l) => {
+    const a = el("a", { href: l.url, target: "_blank", rel: "noopener noreferrer", class: "link_title", title: `${l.url}\n（名前は ✎・ダブルクリック・F2 で変えられる）` }, l.title);
+    a.addEventListener("dblclick", (ev) => {
+      ev.preventDefault();
+      const input = el("input", { type: "text", class: "link_rename" });
+      input.value = l.title;
+      let done = false;
+      const finish = async (save) => {
+        if (done) return;
+        done = true;
+        if (save && input.value.trim() !== l.title) await api("PATCH", `/links/${l.id}`, { title: input.value });
+        input.remove();
+        await reload();
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.isComposing) finish(true);
+        if (e.key === "Escape") finish(false);
+      });
+      input.addEventListener("blur", () => finish(true));
+      a.replaceWith(input);
+      input.focus();
+      input.select();
+    });
+    return el("li", {},
+      a,
+      el("button", {
+        type: "button",
+        class: "icon_button",
+        title: "名前を変える（ダブルクリック・F2 でも）",
+        onclick: () => a.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
+      }, "✎"),
+      el("button", {
+        type: "button",
+        class: "icon_button danger",
+        title: "この関連資料を外す",
+        onclick: async () => {
+          await api("DELETE", `/links/${l.id}`);
+          await reload();
+          toast(`「${l.title}」を外しました（Ctrl+Z で元に戻す）`);
+        },
+      }, "×"));
+  }));
+}
+
 function render_detail() {
   const panel = $("detail");
   const task = state.selectedId === null ? null : state.byId.get(state.selectedId);
   panel.querySelector(".detail_header h2").textContent = state.selected.size > 1 ? `詳細（${state.selected.size} 件選択中）` : "詳細";
-  panel.hidden = !task;
+  // 詳細の欄は、タスクを選べるタブでは最初から場所を取っておく（選んだときに左の配置がずれないように）
+  panel.hidden = !["gantt", "list", "work"].includes(state.tab);
+  $("detail_body").hidden = !task;
+  $("detail_empty").hidden = Boolean(task);
+  $("detail_close").hidden = !task;
   if (!task) {
     renderedDetailId = null;
     return;
@@ -664,7 +959,23 @@ function render_detail() {
   }
   $("detail_actual").textContent = parts.join(" ／ ") || "まだ工数の記録はありません（工数記録タブで振り分け）";
   $("detail_actual").classList.toggle("over", Boolean(task.estimate_min && actual > task.estimate_min));
-  $("detail_tags").replaceChildren(...task.tags.map((name) => el("span", { class: "tag_chip", style: tag_style(name) },
+  // 「その他」：タブを切り替えたときだけ開閉を決める（詳細タブでは開く、ほかでは畳む）。中身は畳んでいても見出しに要約を出す
+  if (detailMoreTab !== state.tab) {
+    detailMoreTab = state.tab;
+    $("detail_more").open = state.tab === "list";
+  }
+  const more = [];
+  if (task.jira_key) more.push(task.jira_key);
+  if (task.estimate_min) more.push(`見積もり ${fmt_hours(task.estimate_min)}`);
+  if (actual) more.push(`記録 ${fmt_hours(actual)}`);
+  $("detail_more_summary").textContent = more.length ? `：${more.join("・")}` : "（Jira 課題・見積もり）";
+  render_detail_links(task);
+  $("detail_tags").replaceChildren(...task.tags.map((name) => el("span", {
+    class: "tag_chip",
+    style: tag_style(name),
+    title: "ダブルクリックでタグの名前を変える（すべてのタスクで）",
+    ondblclick: () => rename_tag(name),
+  },
     name,
     el("button", {
       type: "button",
@@ -809,6 +1120,7 @@ function setup_detail() {
   let noteTimer;
   const saveNote = () => {
     clearTimeout(noteTimer);
+    noteTimer = null;
     const id = state.selectedId;
     const value = $("detail_note").value;
     if (id !== null && state.byId.has(id) && (state.byId.get(id).note || "") !== value) update(id, { note: value });
@@ -818,7 +1130,51 @@ function setup_detail() {
     noteTimer = setTimeout(saveNote, 800);
   });
   $("detail_note").addEventListener("blur", saveNote);
+  // 関連資料：URL を貼り付けたらすぐ足す（Enter でも足せる）。名前はサーバーがリンク先のページから取る
+  const linkInput = $("detail_link_input");
+  const addLink = async () => {
+    const url = linkInput.value.trim();
+    const id = state.selectedId;
+    if (!url || id === null) return;
+    linkInput.disabled = true;
+    try {
+      await api("POST", `/tasks/${id}/links`, { url });
+      linkInput.value = "";
+      await reload();
+    } finally {
+      linkInput.disabled = false;
+    }
+  };
+  linkInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.isComposing) addLink();
+  });
+  linkInput.addEventListener("paste", () => setTimeout(() => {
+    if (/^https?:\/\/\S+$/.test(linkInput.value.trim())) addLink();
+  }, 0));
+  // 打ってすぐ再読み込み・タブを閉じたときも、メモを失わないよう送っておく（keepalive でページが閉じても届く）
+  window.addEventListener("pagehide", () => {
+    if (!noteTimer) return;
+    clearTimeout(noteTimer);
+    noteTimer = null;
+    const id = state.selectedId;
+    const value = $("detail_note").value;
+    if (id === null || !state.byId.has(id) || (state.byId.get(id).note || "") === value) return;
+    fetch(`/api/tasks/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: value }),
+      keepalive: true,
+    });
+  });
   $("detail_delete").addEventListener("click", () => remove(state.selectedId));
+}
+
+/// 文字を入力する欄か（チェックボックスや選択肢にフォーカスがあるときは、アプリのショートカットを効かせる）
+function is_text_entry(node) {
+  if (!node) return false;
+  if (node.tagName === "TEXTAREA" || node.isContentEditable) return true;
+  if (node.tagName !== "INPUT") return false;
+  return !["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"].includes(node.type);
 }
 
 // ---------- 起動 ----------
@@ -830,10 +1186,16 @@ function setup() {
   $("redo_button").addEventListener("click", () => undo_redo("redo"));
 
   document.addEventListener("keydown", (ev) => {
-    const tag = document.activeElement?.tagName;
-    const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
+    const typing = is_text_entry(document.activeElement);
     const mod = ev.ctrlKey || ev.metaKey;
     // 入力欄の中では、文字の取り消しとしてブラウザに任せる
+    // Ctrl+S：ブラウザの「名前を付けて保存」（HTML のダウンロード）を出さず、自動で保存していることを薄く知らせる。
+    // 入力中でも同じ（入力した内容は欄を離れたときに保存される）
+    if (mod && !ev.altKey && !ev.shiftKey && ev.key.toLowerCase() === "s") {
+      ev.preventDefault();
+      toast("このアプリは自動で保存しています（入力中の欄は、欄を離れると保存されます）", "faint");
+      return;
+    }
     if (mod && !typing && !ev.altKey) {
       const k = ev.key.toLowerCase();
       if (k === "z" && !ev.shiftKey) {
@@ -850,6 +1212,9 @@ function setup() {
     if (ev.key === "/" && !typing && !mod) {
       ev.preventDefault();
       begin_add("inbox");
+    } else if (ev.key === "F2" && !typing && !mod) {
+      ev.preventDefault();
+      rename_by_f2();
     } else if (ev.key === "Delete" && !typing && !mod && state.tab === "gantt" && state.selected.size > 0) {
       ev.preventDefault();
       delete_tasks_confirm(visible_task_order().filter((id) => state.selected.has(id)));
@@ -859,6 +1224,17 @@ function setup() {
     } else if (ev.key === "Escape" && !typing && state.selectedId !== null) {
       select(null);
     }
+  });
+
+  // 何もない所（タスクの行・詳細パネル・ボタンや入力欄・小窓の外）をクリックしたら、選択を解除する
+  const KEEP_SELECTION = "[data-task_id], #detail, button, input, select, textarea, label, a, summary, details, " +
+    ".tag_chip, .chip, .link_mark, .db_panel, .template_panel, .tag_picker, .datepicker, .alert_panel, .toast, .top_bar";
+  document.addEventListener("click", (ev) => {
+    if (state.selectedId === null && state.selected.size === 0) return;
+    if (!(ev.target instanceof Element) || !ev.target.isConnected) return; // 描き直しで消えた要素のクリックは無視
+    if (ev.target.closest(KEEP_SELECTION)) return;
+    if (window.getSelection()?.toString()) return; // 文字を選んでいるときはそのまま
+    select(null);
   });
 
   // 開いたまま日付が変わっても表示が古くならないように、画面に戻ったら読み直す
@@ -874,6 +1250,9 @@ function setup() {
   setup_alerts();
   setup_clipboard();
   setup_templates();
+  setup_tag_drop();
+  // 画面を閉じたらアプリに知らせる（ほかに開いている画面がなければ、1 分ほどでアプリが終わる）
+  window.addEventListener("pagehide", () => { navigator.sendBeacon("/api/bye"); });
   load_jira_config().then(() => render_detail());
   setup_detail();
   reload();

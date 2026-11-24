@@ -1,29 +1,94 @@
 "use strict";
 // 線表タブ。左の名前欄で追加・並べ替え・完了・名前変更、右の時間軸で日程をドラッグで決める。
 
-const GANTT_DAY_W = 28; // 1 日の幅（px）
-const GANTT_DAYS = 42; // 表示する日数（6 週間）
+// 表示の縮尺。step は「前へ」「次へ」で動く日数、days_every は日付の数字を出す間隔（0 なら出さず月だけ）
+const GANTT_SCALES = {
+  weeks: { label: "6 週間", dayW: 12, days: 42, step: 7, stepText: "週", back: 7, days_every: "day", fit: true },
+  // どの縮尺も、横にスクロールしなくても全体が見えるよう、線表の幅に合わせて 1 日の幅を決める（dayW は最小値）
+  quarter: { label: "3 か月", dayW: 4, days: 98, step: 28, stepText: "4 週", back: 14, days_every: "monday", fit: true },
+  year: { label: "1 年", dayW: 1.5, days: 371, step: 91, stepText: "3 か月", back: 28, days_every: "none", fit: true },
+};
+let GANTT_DAY_W = 28; // 1 日の幅（px）。縮尺で変わる
+let GANTT_DAYS = 42; // 表示する日数。縮尺で変わる
 
 const gantt = {
   start: null, // 表示開始日（月曜, YYYY-MM-DD）
+  scale: "weeks", // GANTT_SCALES のキー
   filter: { text: "", tags: [], hideDone: false, ...load_json("gantt_filter", {}) },
   matched: new Set(), // 絞り込み条件に合う id
   shown: new Set(), // 出す id（条件に合うものと、その祖先）
+  pinned: new Set(), // 絞り込み中に追加したタスク（条件に合わなくても、絞り込みを変えるまで出しておく）
 };
 
+function gantt_scale() {
+  return GANTT_SCALES[gantt.scale];
+}
+
+/// 縮尺を変える（今日の位置が見えるように表示範囲も合わせ直す）
+function set_gantt_scale(key) {
+  if (!GANTT_SCALES[key]) key = "weeks";
+  gantt.scale = key;
+  GANTT_DAY_W = GANTT_SCALES[key].dayW;
+  GANTT_DAYS = GANTT_SCALES[key].days;
+  save_json("gantt_scale", key);
+  const sc = gantt_scale();
+  $("gantt_prev").textContent = `◀ 前の${sc.stepText}`;
+  $("gantt_next").textContent = `次の${sc.stepText} ▶`;
+  for (const b of document.querySelectorAll("#gantt_scale button")) b.classList.toggle("active", b.dataset.scale === key);
+}
+
+/// 「前の週」「前の 3 か月」のように縮尺で文字が変わっても、ボタンの幅（と右にあるボタンの位置）が
+/// 変わらないよう、いちばん長い文字に合わせた幅を最初から取っておく
+let stepWidthsFixed = false;
+function fix_step_button_widths() {
+  // 線表のタブが隠れている間は幅を測れないので、見えている描画のときに 1 回だけ測る
+  if (stepWidthsFixed || $("gantt_prev").offsetWidth === 0) return;
+  stepWidthsFixed = true;
+  for (const [id, text] of [["gantt_prev", (sc) => `◀ 前の${sc.stepText}`], ["gantt_next", (sc) => `次の${sc.stepText} ▶`]]) {
+    const b = $(id);
+    let max = 0;
+    for (const sc of Object.values(GANTT_SCALES)) {
+      b.textContent = text(sc);
+      max = Math.max(max, b.getBoundingClientRect().width);
+    }
+    b.style.minWidth = `${Math.ceil(max)}px`;
+  }
+  set_gantt_scale(gantt.scale); // 文字を今の縮尺に戻す
+}
+
 function gantt_reset() {
-  gantt.start = add_days(monday_of(today_text()), -7); // 先週の月曜から
+  // 少し前（縮尺に応じて 1〜4 週）の月曜から
+  gantt.start = monday_of(add_days(today_text(), -gantt_scale().back));
 }
 
 function setup_gantt() {
+  $("gantt_scale").replaceChildren(...Object.entries(GANTT_SCALES).map(([key, sc]) =>
+    el("button", {
+      type: "button",
+      class: "small_button",
+      "data-scale": key,
+      title: `${sc.label}を表示する`,
+      onclick: () => { set_gantt_scale(key); gantt_reset(); render_gantt(); },
+    }, sc.label)));
+  set_gantt_scale(load_json("gantt_scale", "weeks"));
   gantt_reset();
-  $("gantt_prev").addEventListener("click", () => { gantt.start = add_days(gantt.start, -7); render_gantt(); });
-  $("gantt_next").addEventListener("click", () => { gantt.start = add_days(gantt.start, 7); render_gantt(); });
+  $("gantt_prev").addEventListener("click", () => { gantt.start = add_days(gantt.start, -gantt_scale().step); render_gantt(); });
+  $("gantt_next").addEventListener("click", () => { gantt.start = add_days(gantt.start, gantt_scale().step); render_gantt(); });
   $("gantt_today").addEventListener("click", () => { gantt_reset(); render_gantt(); });
   $("inbox_add").addEventListener("click", () => begin_add("inbox"));
   attach_group_drop($("inbox_header"), "inbox");
   setup_gantt_wheel();
   setup_trash();
+  // 幅に合わせる縮尺では、線表の幅が変わったら（窓の大きさ・右の詳細パネルの開閉）描き直す
+  let resizeFrame = 0;
+  let lastWidth = 0;
+  new ResizeObserver(() => {
+    const w = $("gantt").clientWidth;
+    if (w === lastWidth) return;
+    lastWidth = w;
+    if (state.tab !== "gantt" || !gantt_scale().fit || resizeFrame) return;
+    resizeFrame = requestAnimationFrame(() => { resizeFrame = 0; render_gantt(); });
+  }).observe($("gantt"));
 
   let timer;
   $("gfilter_text").addEventListener("input", (ev) => {
@@ -46,6 +111,7 @@ function setup_gantt() {
 }
 
 function save_gantt_filter() {
+  gantt.pinned.clear(); // 絞り込みを変えたら、追加したタスクを出し続けるのはやめる
   save_json("gantt_filter", gantt.filter);
   render_gantt();
 }
@@ -62,7 +128,8 @@ function toggle_gantt_tag(name) {
 /// 線表の上でのスクロール：普通のホイールは行の上下スクロール（端で止まる。行が少なくて余地がないときはページ全体）。
 /// Shift＋ホイール（とトラックパッドの横スクロール）で表示範囲を前後に動かす（下・右へ回すと未来へ）
 function setup_gantt_wheel() {
-  const PX_PER_DAY = 40; // この量のスクロールで 1 日動く
+  // この量のスクロールで 1 日動く（縮尺を小さくするほど 1 回で多くの日数が動く）
+  const px_per_day = () => Math.max(1, (40 * GANTT_DAY_W) / 28);
   let acc = 0;
   let frame = 0;
   $("gantt").addEventListener("wheel", (ev) => {
@@ -84,9 +151,9 @@ function setup_gantt_wheel() {
     // Shift＋ホイールはブラウザによって deltaX にも deltaY にも来る
     const delta = horizontal ? ev.deltaX : ev.deltaY;
     acc += delta * scale;
-    const days = Math.trunc(acc / PX_PER_DAY);
+    const days = Math.trunc(acc / px_per_day());
     if (!days) return;
-    acc -= days * PX_PER_DAY;
+    acc -= days * px_per_day();
     gantt.start = add_days(gantt.start, days);
     // 描き直しは 1 フレームに 1 回にまとめる
     if (!frame) {
@@ -100,13 +167,41 @@ function setup_gantt_wheel() {
 
 // ---------- ゴミ箱 ----------
 /// 右下のゴミ箱を出す・隠す。"bar"（バーを運ぶ＝日程だけ消す）/ "task"（行を運ぶ＝タスクを削除）/ null（隠す）
-function show_trash(kind) {
+function show_trash(kind, from = null) {
   const t = $("gantt_trash");
   t.hidden = kind === null;
   t.classList.remove("over");
   t.classList.toggle("task_mode", kind === "task");
+  t.removeAttribute("style");
   if (kind === "bar") t.textContent = "🗑️ ここに入れると日程を消す";
-  if (kind === "task") t.textContent = "🗑️ ここに入れるとタスクを削除";
+  if (kind === "task") {
+    t.textContent = "🗑️ ここに入れるとタスクを削除";
+    if (from) place_task_trash(t, from);
+  }
+}
+
+/// 名前を運ぶときは、つかんだ行の高さで、少し右に小さなゴミ箱を出す（画面の右下だと遠すぎるため）。
+/// つかんだ所のすぐ横に出すと、少し動かしただけで誤って入れてしまうので、マウスから 100px 以上離す。
+/// 線表の中の行なら、時間軸の側（名前の欄の右）に出して名前の上には重ねない
+function place_task_trash(t, { row, x, y }) {
+  const W = 180, H = 64, GAP = 100, MARGIN = 12;
+  const box = $("gantt").getBoundingClientRect();
+  const inGantt = y >= box.top && y <= box.bottom && x >= box.left && x <= box.right;
+  const nameW = parseFloat(getComputedStyle($("gantt")).getPropertyValue("--gantt_name_w")) || 0;
+  let left = x + GAP;
+  if (inGantt) left = Math.max(left, box.left + nameW + 24);
+  if (left + W > window.innerWidth - MARGIN) left = Math.max(MARGIN, x - GAP - W); // 右に入らなければ左へ
+  const top = Math.max(MARGIN, Math.min(row.top + row.height / 2 - H / 2, window.innerHeight - H - MARGIN));
+  Object.assign(t.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${W}px`,
+    height: `${H}px`,
+    right: "auto",
+    bottom: "auto",
+    padding: "6px 10px",
+    fontSize: "12px",
+  });
 }
 
 /// 行（名前）のドラッグをゴミ箱で受けて、タスクを削除する
@@ -148,7 +243,7 @@ function compute_gantt_filter() {
   const walk = (t) => {
     let childShown = false;
     for (const c of children_of(t.id)) childShown = walk(c) || childShown;
-    const self = gantt.matched.has(t.id) && !(gantt.filter.hideDone && t.status === "done");
+    const self = (gantt.matched.has(t.id) && !(gantt.filter.hideDone && t.status === "done")) || gantt.pinned.has(t.id);
     const show = self || childShown;
     if (show) gantt.shown.add(t.id);
     return show;
@@ -156,12 +251,24 @@ function compute_gantt_filter() {
   for (const key of ["root", "inbox"]) children_of(key).forEach(walk);
 }
 
+/// 絞り込みの条件に合わないのに、追加したばかりなので出しているタスクか
+function gantt_pinned_only(t) {
+  return gantt.pinned.has(t.id) && !gantt.matched.has(t.id);
+}
+
+/// その印（行の名前の横）
+function pinned_note(t) {
+  return gantt_pinned_only(t)
+    ? [el("span", { class: "pinned_note", title: "絞り込み中に追加したので出しています。絞り込みを変えると見えなくなります" }, "絞り込みの対象外")]
+    : [];
+}
+
 function gantt_visible(t) {
   return gantt.shown.has(t.id);
 }
 
 function render_gantt_filter() {
-  $("gfilter_tags").replaceChildren(...tag_filter_buttons(gantt.filter.tags, toggle_gantt_tag));
+  $("gfilter_tags").replaceChildren(...tag_filter_buttons(() => gantt.filter.tags, toggle_gantt_tag));
   const input = $("gfilter_text");
   if (document.activeElement !== input) input.value = gantt.filter.text;
   $("gfilter_hide_done").checked = gantt.filter.hideDone;
@@ -213,7 +320,24 @@ function gantt_rows() {
 }
 
 // ---------- 描画 ----------
+function days_in_month(y, m) {
+  return new Date(y, m, 0).getDate();
+}
+
+/// 縮尺が「幅に合わせる」なら、いまの線表の幅から 1 日の幅を決める
+function fit_gantt_day_width() {
+  const sc = gantt_scale();
+  if (!sc.fit) return;
+  const box = $("gantt");
+  const nameW = parseFloat(getComputedStyle(box).getPropertyValue("--gantt_name_w")) || 0;
+  // 端の ◆・▶ やバーのつまみが少しはみ出すので、その分の余白を残す
+  const avail = box.clientWidth - nameW - 10;
+  GANTT_DAY_W = Math.max(sc.dayW, Math.floor((avail / GANTT_DAYS) * 100) / 100);
+}
+
 function render_gantt() {
+  fix_step_button_widths();
+  fit_gantt_day_width();
   compute_gantt_filter();
   render_gantt_filter();
   const start = gantt.start;
@@ -224,8 +348,10 @@ function render_gantt() {
   const ctx = { start, end, today, width, x_of };
   $("gantt_range").textContent = `${short_date(start)} 〜 ${short_date(end)}`;
 
-  // 日付の見出しと背景（週末・週の区切り・今日の線）
-  const days = el("div", { class: "gantt_days", style: `width:${width}px` });
+  // 日付の見出しと背景（週末・週の区切り・今日の線）。縮尺が小さいときは週末・週の線を省き、月の線を引く
+  const sc = gantt_scale();
+  const fine = GANTT_DAY_W >= 8;
+  const days = el("div", { class: "gantt_days scale_" + gantt.scale + (GANTT_DAY_W < 20 ? " narrow" : ""), style: `width:${width}px` });
   const bg = el("div", { class: "gantt_bg", style: `left:var(--gantt_name_w);width:${width}px` });
   for (let i = 0; i < GANTT_DAYS; i++) {
     const d = add_days(start, i);
@@ -234,15 +360,21 @@ function render_gantt() {
     const weekend = wd === 0 || wd === 6;
     const monthStart = dd === 1 || i === 0;
     const cell = el("div", {
-      class: "gantt_day" + (weekend ? " weekend" : "") + (d === today ? " today" : "") + (monthStart ? " month_start" : ""),
+      class: "gantt_day" + (weekend && fine ? " weekend" : "") + (d === today ? " today" : "") + (monthStart ? " month_start" : ""),
       style: `left:${i * GANTT_DAY_W}px;width:${GANTT_DAY_W}px`,
       title: short_date(d),
     });
-    if (monthStart) cell.append(el("span", { class: "month" }, `${y === new Date().getFullYear() ? "" : y + "/"}${m}月`));
-    cell.append(el("span", { class: "dnum" }, String(dd)));
+    // 月の見出し。1 年表示は幅が狭いので「1月」だけ（1 月は年を出す）。
+    // 縮尺が小さいとき、最初の列が月の終わりなら、すぐ次の月の見出しと重なるので出さない
+    const label = gantt.scale === "year"
+      ? (m === 1 ? `${y}年` : `${m}月`)
+      : `${y === new Date().getFullYear() ? "" : y + "/"}${m}月`;
+    const crowded = i === 0 && dd !== 1 && !fine && days_in_month(y, m) - dd < 10;
+    if (monthStart && !crowded) cell.append(el("span", { class: "month" }, label));
+    if (sc.days_every === "day" || (sc.days_every === "monday" && wd === 1)) cell.append(el("span", { class: "dnum" }, String(dd)));
     days.append(cell);
-    if (weekend) bg.append(el("div", { class: "weekend", style: `left:${i * GANTT_DAY_W}px;width:${GANTT_DAY_W}px` }));
-    if (wd === 1 && i > 0) bg.append(el("div", { class: "week_line", style: `left:${i * GANTT_DAY_W}px` }));
+    if (weekend && fine) bg.append(el("div", { class: "weekend", style: `left:${i * GANTT_DAY_W}px;width:${GANTT_DAY_W}px` }));
+    if (fine ? wd === 1 && i > 0 : dd === 1 && i > 0) bg.append(el("div", { class: "week_line", style: `left:${i * GANTT_DAY_W}px` }));
   }
   if (today >= start && today <= end) {
     bg.append(el("div", { class: "today_line", style: `left:${x_of(today) + GANTT_DAY_W / 2 - 1}px` }));
@@ -318,7 +450,7 @@ function inbox_row(t, depth, hasKids) {
   const done = t.status === "done";
   const row = el("div", {
     class: "inbox_row" + (is_selected(t.id) ? " selected" : "") + (done ? " done" : "") +
-      (gantt.matched.has(t.id) ? "" : " dim"),
+      (gantt.matched.has(t.id) || gantt.pinned.has(t.id) ? "" : " dim"),
     "data-task_id": t.id,
     style: `padding-left:${8 + depth * 16}px`,
     onclick: (ev) => select(t.id, ev),
@@ -343,6 +475,8 @@ function inbox_row(t, depth, hasKids) {
   if (t.next_action_date && !done) dates.push(`▶ ${short_date(t.next_action_date)}`);
   if (t.planned_end) dates.push(`〜${short_date(t.planned_end)}`);
   row.append(twisty, check, label,
+    ...pinned_note(t),
+    ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag),
     ...(dates.length ? [el("span", { class: "date_chip" }, dates.join(" "))] : []),
     el("span", { class: "row_actions" },
@@ -364,7 +498,7 @@ function gantt_row(r, ctx) {
   const done = t.status === "done";
   const row = el("div", {
     class: "gantt_row" + (is_selected(t.id) ? " selected" : "") + (done ? " done" : "") +
-      (gantt.matched.has(t.id) ? "" : " dim"),
+      (gantt.matched.has(t.id) || gantt.pinned.has(t.id) ? "" : " dim"),
     "data-task_id": t.id,
     onclick: (ev) => select(t.id, ev),
   });
@@ -388,6 +522,8 @@ function gantt_row(r, ctx) {
   }, t.title);
   const name = el("div", { class: "gantt_name", style: `padding-left:${8 + r.depth * 16}px` },
     twisty, check, label,
+    ...pinned_note(t),
+    ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag),
     el("span", { class: "row_actions" },
       icon_button("➕", "子タスクを追加", () => begin_add(t.id), "emoji"),
@@ -405,13 +541,16 @@ function gantt_row(r, ctx) {
     const s2 = s < start ? start : s;
     const e2 = e > end ? end : e;
     node.style.left = `${x_of(s2) + 1}px`;
-    node.style.width = `${(days_between(s2, e2) + 1) * GANTT_DAY_W - 2}px`;
+    // 縮尺が小さいと 1 日のバーが細くなりすぎるので、最低 3px にする
+    node.style.width = `${Math.max(3, (days_between(s2, e2) + 1) * GANTT_DAY_W - 2)}px`;
     track.append(node);
   };
   const mark = (cls, ch, d, title) => {
     if (d < start) { clipped.left = true; return; }
     if (d > end) { clipped.right = true; return; }
-    track.append(el("span", { class: "mark " + cls, style: `left:${x_of(d)}px;width:${GANTT_DAY_W}px`, title }, ch));
+    // ◆・▶ は 1 日の幅が狭くても読める幅で、その日の中央に置く
+    const w = Math.max(GANTT_DAY_W, 14);
+    track.append(el("span", { class: "mark " + cls, style: `left:${x_of(d) + GANTT_DAY_W / 2 - w / 2}px;width:${w}px`, title }, ch));
   };
 
   const span = span_of(t);
@@ -485,6 +624,9 @@ function attach_gantt_drag(track, t, span, ctx) {
     }
     if (!mode) return; // バーのある行の空いている所は選択だけ
 
+    // 入力中の欄（詳細パネルなど）を先に確定させる。preventDefault で欄からフォーカスが外れず、
+    // 変更が保存されないまま別のタスクに切り替わってしまうため
+    if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) document.activeElement.blur();
     ev.preventDefault();
     track.setPointerCapture(ev.pointerId);
     const rect = track.getBoundingClientRect();
@@ -543,7 +685,7 @@ function attach_gantt_drag(track, t, span, ctx) {
       preview.hidden = e2 < s2;
       if (e2 >= s2) {
         preview.style.left = `${ctx.x_of(s2) + 1}px`;
-        preview.style.width = `${(days_between(s2, e2) + 1) * GANTT_DAY_W - 2}px`;
+        preview.style.width = `${Math.max(3, (days_between(s2, e2) + 1) * GANTT_DAY_W - 2)}px`;
       }
       label.textContent = `${short_date(s)} 〜 ${short_date(en)}（${days_between(s, en) + 1} 日）`;
       label.style.left = `${e.clientX + 14}px`;

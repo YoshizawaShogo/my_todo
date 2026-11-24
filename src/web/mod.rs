@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,45 @@ pub struct AppState {
     pub db_path: Arc<Mutex<std::path::PathBuf>>,
     /// Jira に送信中か（送信中はデータベースを切り替えない。送信の記録が別の DB に入らないように）
     pub jira_sending: Arc<std::sync::atomic::AtomicBool>,
+    /// 待ち受けているポート（Host・Origin の確認に使う）
+    pub port: u16,
+    /// 画面が開いているか（画面を閉じたら自動で終わるため）
+    pub activity: Arc<Activity>,
+}
+
+/// 画面を閉じてから、この時間だれも（別のタブ・読み直した画面も）つながってこなければ終わる。
+/// 隠れているタブは定期の確認が 1 分に 1 回まで落とされるので、それより長くする
+const EXIT_AFTER_CLOSE: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// 画面からの最後の要求と、画面が閉じられた時刻
+pub struct Activity {
+    last_seen: Mutex<std::time::Instant>,
+    closed_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Activity {
+            last_seen: Mutex::new(std::time::Instant::now()),
+            closed_at: Mutex::new(None),
+        }
+    }
+
+    fn seen(&self) {
+        *self.last_seen.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+    }
+
+    /// 画面が閉じられた（ページの pagehide で届く）
+    pub fn closed(&self) {
+        *self.closed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// 画面が閉じられたあと、決めた時間だれもつながってこなかったか
+    fn should_exit(&self) -> bool {
+        let closed = *self.closed_at.lock().unwrap_or_else(|e| e.into_inner());
+        let last = *self.last_seen.lock().unwrap_or_else(|e| e.into_inner());
+        closed.is_some_and(|c| last <= c && c.elapsed() >= EXIT_AFTER_CLOSE)
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -30,7 +69,10 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index_html))
         .route("/{file}", get(static_file))
         .nest("/api", api::router())
-        .layer(axum::middleware::from_fn(check_host_and_origin))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            check_host_and_origin,
+        ))
         .with_state(state)
 }
 
@@ -38,20 +80,27 @@ pub fn router(state: AppState) -> Router {
 /// （フォームでの POST や、DNS リバインディング）。Host が 127.0.0.1 か localhost の要求だけを受け付け、
 /// Origin が付いているならこのアプリの画面からの要求だけを受け付ける
 async fn check_host_and_origin(
+    State(state): State<AppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let allowed = {
         let headers = req.headers();
         let header_str = |name| headers.get(name).and_then(|v| v.to_str().ok());
-        let host_ok = header_str(header::HOST).is_some_and(is_local_host);
+        let host_ok = header_str(header::HOST).is_some_and(|h| is_local_host(h, state.port));
         let origin_ok = match header_str(header::ORIGIN) {
             None => true,
-            Some(origin) => origin.strip_prefix("http://").is_some_and(is_local_host),
+            Some(origin) => origin
+                .strip_prefix("http://")
+                .is_some_and(|h| is_local_host(h, state.port)),
         };
         host_ok && origin_ok
     };
     if allowed {
+        // 画面からの要求（閉じた知らせ以外）があれば、まだ開いている
+        if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/bye" {
+            state.activity.seen();
+        }
         next.run(req).await
     } else {
         (
@@ -62,10 +111,13 @@ async fn check_host_and_origin(
     }
 }
 
-/// "127.0.0.1:8765" や "localhost:8765" か（ポートは問わない）
-fn is_local_host(host: &str) -> bool {
-    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
-    matches!(name, "127.0.0.1" | "localhost")
+/// "127.0.0.1:8765" や "localhost:8765" か。ポートも自分のものに限る
+/// （同じ PC の別のポートで動いているほかのアプリのページから、この API を呼ばせないため）
+fn is_local_host(host: &str, port: u16) -> bool {
+    let Some((name, p)) = host.rsplit_once(':') else {
+        return false;
+    };
+    matches!(name, "127.0.0.1" | "localhost") && p.parse::<u16>() == Ok(port)
 }
 
 pub async fn serve(
@@ -73,6 +125,7 @@ pub async fn serve(
     db_path: std::path::PathBuf,
     port: u16,
     open_browser: bool,
+    keep_running: bool,
 ) -> Result<()> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let url = format!("http://{addr}/");
@@ -98,12 +151,31 @@ pub async fn serve(
         conn: Arc::new(Mutex::new(conn)),
         db_path: Arc::new(Mutex::new(crate::config::normalize(&db_path))),
         jira_sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        port,
+        activity: Arc::new(Activity::new()),
+    };
+    // 画面を閉じたら終わる（--keep_running のときは終わらない）。Jira に送信中は待つ
+    let watch = state.clone();
+    let closed_for_good = async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if !keep_running
+                && watch.activity.should_exit()
+                && !watch.jira_sending.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                println!("my_todo: 画面が閉じられたので終了します");
+                return;
+            }
+        }
     };
     // 先に要求を受け付け始め、ブラウザから実際に開けるようになってから案内する
     let server = tokio::spawn(async move {
         axum::serve(listener, router(state))
             .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    () = closed_for_good => {}
+                }
             })
             .await
     });
@@ -265,6 +337,11 @@ const STATIC_FILES: &[(&str, &str, &str)] = &[
     ("list.js", "text/javascript", include_str!("static/list.js")),
     ("work.js", "text/javascript", include_str!("static/work.js")),
     ("style.css", "text/css", include_str!("static/style.css")),
+    (
+        "favicon.svg",
+        "image/svg+xml",
+        include_str!("static/favicon.svg"),
+    ),
 ];
 
 /// 版の印。.exe に埋め込んだ画面のファイルとバージョンから計算するハッシュ（16 進 8 桁）。
@@ -315,5 +392,20 @@ async fn static_file(Path(file): Path<String>) -> Response {
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_host;
+
+    #[test]
+    fn host_must_be_local_and_same_port() {
+        assert!(is_local_host("127.0.0.1:8765", 8765));
+        assert!(is_local_host("localhost:8765", 8765));
+        assert!(!is_local_host("localhost:3000", 8765));
+        assert!(!is_local_host("localhost", 8765));
+        assert!(!is_local_host("evil.example.com:8765", 8765));
+        assert!(!is_local_host("127.0.0.1.evil.example.com:8765", 8765));
     }
 }

@@ -45,6 +45,14 @@ str_enum! {
     }
 }
 
+/// タスクの関連資料（URL と表示名）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TaskLink {
+    pub id: i64,
+    pub url: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Task {
     pub id: i64,
@@ -74,6 +82,8 @@ pub struct Task {
     pub actual_min: i64,
     /// 紐付けた Jira の課題キー（例：ABC-123）
     pub jira_key: Option<String>,
+    /// 関連資料（URL）
+    pub links: Vec<TaskLink>,
 }
 
 /// 登録に必要なのはタイトルだけ。親を指定しなければ未分類に入る。

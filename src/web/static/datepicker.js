@@ -54,6 +54,13 @@ function setup_date_inputs() {
       input.dataset.lastValid = v;
     }, true);
     input.addEventListener("focus", () => open_datepicker(input));
+    // Tab などで欄からフォーカスが外れたら閉じる（吹き出しの中を押してもフォーカスは外れない）。
+    // 開いたままだと下の欄に重なり、そこを押したつもりで日付が変わってしまう
+    input.addEventListener("blur", () => {
+      setTimeout(() => {
+        if (datepicker.input === input && document.activeElement !== input) close_datepicker();
+      }, 0);
+    });
     input.addEventListener("click", () => open_datepicker(input));
     input.addEventListener("keydown", (ev) => {
       if (ev.key === "Escape") close_datepicker();

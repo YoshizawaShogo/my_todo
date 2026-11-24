@@ -16,8 +16,7 @@ const clip = {
 /// タスクのコピー・貼り付けとして扱ってよいか
 function task_clipboard_active() {
   if (state.tab !== "gantt") return false;
-  const tag = document.activeElement?.tagName;
-  if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return false;
+  if (is_text_entry(document.activeElement)) return false;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed && sel.toString().trim()) return false; // 画面の文字を選んでいる
   return true;

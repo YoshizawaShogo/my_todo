@@ -17,8 +17,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 
 [target.'cfg(windows)'.dependencies]
-# ダブルクリックで起動したかどうか（コンソールを自分だけが使っているか）を調べる
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+# 窓のないアプリとして動くので、コマンドプロンプトの窓につなぐ・エラーをダイアログで出す
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 # 配布する .exe を小さくする（デバッグ用のシンボルを除く）

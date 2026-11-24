@@ -4,6 +4,7 @@
 pub mod agenda_service;
 pub mod calendar;
 pub mod jira_service;
+pub mod link_service;
 pub mod task_service;
 pub mod template_service;
 pub mod undo_service;
@@ -78,12 +79,16 @@ impl<'a> Tx<'a> {
         })
     }
 
+    /// 確定する。失敗したとき（外部キーの遅延確認で弾かれたときなど）は SQLite がトランザクションを
+    /// 開いたままにするので、done を立てずに Drop で必ず ROLLBACK させる（開きっぱなしにすると、
+    /// その接続のその後の変更がすべて入れ子扱いになって確定されず、書き込みのロックも取られたままになる）
     pub fn commit(mut self) -> rusqlite::Result<()> {
-        self.done = true;
         self.conn.execute_batch(match self.kind {
             TxKind::Outer => "COMMIT",
             TxKind::Nested => "RELEASE svc",
-        })
+        })?;
+        self.done = true;
+        Ok(())
     }
 }
 

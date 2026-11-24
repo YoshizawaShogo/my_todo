@@ -141,6 +141,9 @@ pub fn update_settings(conn: &Connection, patch: SettingsPatch) -> ServiceResult
 // ---------- 振り分け ----------
 /// 勤務時間を割合で 30 分刻みに振り分ける。合計は勤務時間に一致する。
 /// 端数は小数部分の大きい順（同じなら割合の大きい順、先に並んだ順）に 30 分ずつ配る
+/// 1 件の割合の上限（足しても桁あふれしない範囲）
+const MAX_WEIGHT: f64 = 1_000_000.0;
+
 pub fn allocate(worked_min: i64, weights: &[f64]) -> Vec<i64> {
     let total: f64 = weights.iter().sum();
     if total <= 0.0 || worked_min <= 0 {
@@ -255,8 +258,11 @@ pub fn save_day(conn: &Connection, date: &str, input: SaveDay) -> ServiceResult<
     }
     let mut allocs: Vec<Allocation> = Vec::new();
     for a in input.allocations {
-        if !a.weight.is_finite() || a.weight < 0.0 {
-            return Err(ServiceError::Invalid("割合は 0 以上にしてください".into()));
+        // 大きすぎる値は合計が無限大になって振り分けが崩れるので弾く
+        if !a.weight.is_finite() || !(0.0..=MAX_WEIGHT).contains(&a.weight) {
+            return Err(ServiceError::Invalid(format!(
+                "割合は 0〜{MAX_WEIGHT} にしてください"
+            )));
         }
         if a.weight == 0.0 {
             continue;

@@ -125,6 +125,8 @@ function render_work() {
 // ---------- 描画 ----------
 function draw_work() {
   if (!work.day || work.day.date !== work.date) return;
+  // 消されたタスク（画面・Ctrl+Z・AI で）の行は外す。残すと描くときに例外になり、ほかの画面の描き直しも止まる
+  work.rows = work.rows.filter((r) => state.byId.has(r.task_id));
   $("work_date").value = work.date;
   draw_week();
 

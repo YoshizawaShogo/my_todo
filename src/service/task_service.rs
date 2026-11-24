@@ -2,7 +2,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::{ServiceError, ServiceResult, Tx, now_text};
 use crate::model::{
-    EventKind, MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, TaskPatch, TaskStatus,
+    EventKind, MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, TaskLink, TaskPatch,
+    TaskStatus,
 };
 
 const TASK_COLUMNS: &str = "id, parent_id, title, kind, external_job_id, status, is_inbox, \
@@ -32,6 +33,7 @@ fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         tags: Vec::new(),
         actual_min: 0,
         jira_key: None,
+        links: Vec::new(),
     })
 }
 
@@ -240,7 +242,32 @@ pub fn get_task(conn: &Connection, id: i64) -> ServiceResult<Task> {
             |r| r.get(0),
         )
         .optional()?;
+    task.links = links_of(conn, id)?;
     Ok(task)
+}
+
+fn row_to_link(r: &Row) -> rusqlite::Result<(i64, TaskLink)> {
+    Ok((
+        r.get(0)?,
+        TaskLink {
+            id: r.get(1)?,
+            url: r.get(2)?,
+            title: r.get(3)?,
+        },
+    ))
+}
+
+const LINK_SQL: &str = "SELECT task_id, id, url, title FROM task_link";
+
+fn links_of(conn: &Connection, task_id: i64) -> ServiceResult<Vec<TaskLink>> {
+    let mut stmt = conn.prepare(&format!(
+        "{LINK_SQL} WHERE task_id = ?1 ORDER BY sort_order, id"
+    ))?;
+    let links = stmt
+        .query_map([task_id], row_to_link)?
+        .map(|r| r.map(|(_, l)| l))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(links)
 }
 
 fn tags_of(conn: &Connection, task_id: i64) -> ServiceResult<Vec<String>> {
@@ -332,7 +359,14 @@ pub fn list_tasks(conn: &Connection) -> ServiceResult<Vec<Task>> {
         let (id, key) = row?;
         links.insert(id, key);
     }
+    let mut task_links: std::collections::HashMap<i64, Vec<TaskLink>> = Default::default();
+    let mut tl_stmt = conn.prepare(&format!("{LINK_SQL} ORDER BY task_id, sort_order, id"))?;
+    for row in tl_stmt.query_map([], row_to_link)? {
+        let (id, link) = row?;
+        task_links.entry(id).or_default().push(link);
+    }
     for t in &mut tasks {
+        t.links = task_links.remove(&t.id).unwrap_or_default();
         t.tags = tags.remove(&t.id).unwrap_or_default();
         t.jira_key = links.remove(&t.id);
         t.actual_min = actual.get(&t.id).copied().unwrap_or(0);
@@ -690,6 +724,7 @@ fn copy_subtree(conn: &Connection, id: i64, parent_id: Option<i64>) -> ServiceRe
             ..Default::default()
         },
     )?;
+    super::link_service::copy_links(conn, id, copy.id)?;
     for child in Siblings::Child(id).ids(conn)? {
         copy_subtree(conn, child, Some(copy.id))?;
     }
@@ -798,6 +833,96 @@ pub fn move_tasks(
     Ok(moved)
 }
 
+/// タグの名前を変える（付いているすべてのタスクで変わる）。新しい名前のタグがすでにあれば、そちらにまとめる。
+/// 名前が変わったタスクの数を返す
+pub fn rename_tag(conn: &Connection, from: &str, to: &str) -> ServiceResult<usize> {
+    let to = normalize_tags(vec![to.to_string()])
+        .into_iter()
+        .next()
+        .ok_or_else(|| ServiceError::Invalid("タグの新しい名前を入れてください".into()))?;
+    let tx = Tx::begin(conn)?;
+    let find = |name: &str| -> ServiceResult<Option<i64>> {
+        Ok(tx
+            .query_row(
+                "SELECT id FROM tag WHERE name = ?1 COLLATE NOCASE",
+                [name.trim().trim_start_matches('#').trim()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    let from_id =
+        find(from)?.ok_or_else(|| ServiceError::Invalid(format!("タグ「{from}」はありません")))?;
+    let ids: Vec<i64> = {
+        let mut stmt =
+            tx.prepare("SELECT task_id FROM task_tag WHERE tag_id = ?1 ORDER BY task_id")?;
+        stmt.query_map([from_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    // 1 件ずつタグを付け替える（履歴に残り、元に戻すでも戻る）
+    for &id in &ids {
+        let task = get_task(&tx, id)?;
+        let mut tags: Vec<String> = task
+            .tags
+            .iter()
+            .filter(|t| {
+                t.to_lowercase() != from.trim().trim_start_matches('#').trim().to_lowercase()
+            })
+            .cloned()
+            .collect();
+        tags.push(to.clone());
+        update_task(
+            &tx,
+            id,
+            TaskPatch {
+                tags: Some(tags),
+                ..Default::default()
+            },
+        )?;
+    }
+    // 大文字小文字だけを変えたとき（同じタグ）は、名前を書き換える
+    if find(&to)? == Some(from_id) {
+        tx.execute(
+            "UPDATE tag SET name = ?1 WHERE id = ?2",
+            params![to, from_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(ids.len())
+}
+
+/// 複数のタスクにタグを 1 つ足す（すでに付いているものはそのまま）。タグが変わった件数を返す
+pub fn add_tag(conn: &Connection, ids: &[i64], name: &str) -> ServiceResult<usize> {
+    let name = normalize_tags(vec![name.to_string()]);
+    let Some(name) = name.first() else {
+        return Err(ServiceError::Invalid("タグの名前がありません".into()));
+    };
+    let tx = Tx::begin(conn)?;
+    let mut changed = 0;
+    for &id in ids {
+        let task = get_task(&tx, id)?;
+        if task
+            .tags
+            .iter()
+            .any(|t| t.to_lowercase() == name.to_lowercase())
+        {
+            continue;
+        }
+        let mut tags = task.tags.clone();
+        tags.push(name.clone());
+        update_task(
+            &tx,
+            id,
+            TaskPatch {
+                tags: Some(tags),
+                ..Default::default()
+            },
+        )?;
+        changed += 1;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// 複数のタスクを子孫ごとまとめて削除する（ほかの選んだタスクの子孫は親と一緒に消えるので個別には消さない）
 pub fn delete_tasks(conn: &Connection, ids: &[i64]) -> ServiceResult<usize> {
     let tx = Tx::begin(conn)?;
@@ -824,6 +949,57 @@ pub fn delete_task(conn: &Connection, id: i64) -> ServiceResult<()> {
 mod tests {
     use super::*;
     use crate::db;
+
+    #[test]
+    fn rename_tag_everywhere_and_merge() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let b = add(&conn, "B", None);
+        let set = |id, tags: &[&str]| {
+            update_task(
+                &conn,
+                id,
+                TaskPatch {
+                    tags: Some(tags.iter().map(|s| s.to_string()).collect()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        set(a.id, &["旧", "残す"]);
+        set(b.id, &["旧", "新"]);
+        assert_eq!(rename_tag(&conn, "旧", "#新").unwrap(), 2);
+        assert_eq!(get_task(&conn, a.id).unwrap().tags, ["新", "残す"]);
+        assert_eq!(get_task(&conn, b.id).unwrap().tags, ["新"]);
+        assert!(list_tags(&conn).unwrap().iter().all(|t| t.name != "旧"));
+        // 大文字小文字だけ変える
+        set(a.id, &["abc"]);
+        rename_tag(&conn, "abc", "ABC").unwrap();
+        assert_eq!(get_task(&conn, a.id).unwrap().tags, ["ABC"]);
+        assert!(rename_tag(&conn, "ない", "x").is_err());
+        assert!(rename_tag(&conn, "ABC", " ").is_err());
+    }
+
+    #[test]
+    fn add_tag_to_many_keeps_existing() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let b = add(&conn, "B", None);
+        update_task(
+            &conn,
+            a.id,
+            TaskPatch {
+                tags: Some(vec!["既存".into(), "急ぎ".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // 大文字小文字・先頭の # の違いは同じタグ
+        assert_eq!(add_tag(&conn, &[a.id, b.id], "#急ぎ").unwrap(), 1);
+        assert_eq!(get_task(&conn, a.id).unwrap().tags, ["急ぎ", "既存"]);
+        assert_eq!(get_task(&conn, b.id).unwrap().tags, ["急ぎ"]);
+        assert!(add_tag(&conn, &[a.id], "  ").is_err());
+    }
 
     fn add(conn: &Connection, title: &str, parent_id: Option<i64>) -> Task {
         create_task(

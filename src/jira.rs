@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use crate::service::jira_service::{self, DraftAction};
 
 const KEYRING_SERVICE: &str = "my_todo";
-const KEYRING_USER: &str = "jira_pat";
+/// 前の版で使っていた、URL に結び付いていない保存先（見つけたら消す）
+const KEYRING_USER_LEGACY: &str = "jira_pat";
 const TOKEN_ENV: &str = "MY_TODO_JIRA_TOKEN";
 
 // ---------- PAT の保管 ----------
@@ -26,13 +27,29 @@ pub enum TokenSource {
     Keyring,
 }
 
-pub fn load_token() -> Option<(String, TokenSource)> {
+/// OS の資格情報での保存名。PAT は Jira の URL（scheme://host:port）ごとに分けて保存する。
+/// データベースごとに URL を持つので、人からもらったデータベースを開いても、
+/// 自分の PAT がそのデータベースに書かれた別の URL へ送られないようにするため
+fn keyring_user(base_url: &str) -> Result<String, String> {
+    let u = reqwest::Url::parse(base_url)
+        .map_err(|e| format!("Jira の URL が正しくありません: {e}"))?;
+    let host = u.host_str().ok_or("Jira の URL にホスト名がありません")?;
+    let port = u.port_or_known_default().unwrap_or(0);
+    Ok(format!(
+        "jira_pat:{}://{}:{port}",
+        u.scheme(),
+        host.to_lowercase()
+    ))
+}
+
+/// その URL に使う PAT。環境変数があればそれを（URL を問わず）使う
+pub fn load_token(base_url: Option<&str>) -> Option<(String, TokenSource)> {
     if let Ok(t) = std::env::var(TOKEN_ENV)
         && !t.trim().is_empty()
     {
         return Some((t.trim().to_string(), TokenSource::Env));
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(base_url?).ok()?).ok()?;
     entry
         .get_password()
         .ok()
@@ -40,8 +57,16 @@ pub fn load_token() -> Option<(String, TokenSource)> {
         .map(|t| (t, TokenSource::Keyring))
 }
 
-pub fn save_token(token: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(keyring_error)?;
+/// その URL 用の PAT を保存する（空文字なら削除）
+pub fn save_token(base_url: Option<&str>, token: &str) -> Result<(), String> {
+    let base_url =
+        base_url.ok_or("先に Jira の URL を保存してください（PAT は URL ごとに保存します）")?;
+    // 前の版の、URL に結び付いていない保存先は消しておく
+    if let Ok(old) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER_LEGACY) {
+        let _ = old.delete_credential();
+    }
+    let entry =
+        keyring::Entry::new(KEYRING_SERVICE, &keyring_user(base_url)?).map_err(keyring_error)?;
     if token.trim().is_empty() {
         return match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -89,6 +114,15 @@ pub trait JiraApi {
         minutes: i64,
     ) -> Result<(), String>;
     async fn delete_worklog(&self, key: &str, id: &str) -> Result<(), String>;
+    /// このアプリが作ったのと同じ作業記録（author が自分・その日の 9:00 開始・同じ時間）がすでにあれば、その id。
+    /// 作成の応答が届かなかった（通信が切れた・時間切れ）あとに送り直して、二重に作らないため
+    async fn find_worklog(
+        &self,
+        key: &str,
+        author: &str,
+        work_date: &str,
+        minutes: i64,
+    ) -> Result<Option<String>, String>;
 }
 
 /// 社内サーバー版（Jira Data Center / Server 8.14 以降）。PAT を Bearer で送る
@@ -265,6 +299,31 @@ impl JiraApi for DataCenterClient {
         .map(|_| ())
     }
 
+    async fn find_worklog(
+        &self,
+        key: &str,
+        author: &str,
+        work_date: &str,
+        minutes: i64,
+    ) -> Result<Option<String>, String> {
+        let v = self
+            .send(
+                self.http.get(self.url(&format!("issue/{key}/worklog"))),
+                key,
+            )
+            .await?;
+        let start = format!("{work_date}T09:00:00");
+        Ok(v["worklogs"].as_array().and_then(|list| {
+            list.iter()
+                .find(|w| {
+                    w["author"]["name"].as_str() == Some(author)
+                        && w["started"].as_str().is_some_and(|s| s.starts_with(&start))
+                        && w["timeSpentSeconds"].as_i64() == Some(minutes * 60)
+                })
+                .and_then(|w| w["id"].as_str().map(String::from))
+        }))
+    }
+
     async fn delete_worklog(&self, key: &str, id: &str) -> Result<(), String> {
         self.send(
             self.http
@@ -289,15 +348,46 @@ pub struct SendResult {
 
 /// 期間の下書きを作り直し、差分を Jira に送る。1 件ずつ送り、成功したものだけ記録する。
 /// 通信中は DB のロックを持たない（画面の操作を止めないため）
+/// 画面で確認した 1 行（送る直前に、作り直した下書きと食い違っていないか確かめる）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ExpectedLine {
+    pub work_date: String,
+    pub issue_key: String,
+    pub action: DraftAction,
+    pub minutes: i64,
+}
+
 pub async fn send_draft<J: JiraApi>(
     api: &J,
     conn: &Mutex<Connection>,
     from: &str,
     to: &str,
+    expected: &[ExpectedLine],
 ) -> Result<Vec<SendResult>, String> {
     let draft = {
         let c = conn.lock().unwrap_or_else(|e| e.into_inner());
         jira_service::build_draft(&c, from, to).map_err(|e| e.to_string())?
+    };
+    // 確認したあとに（AI などで）工数が変わっていたら送らない。確認していない内容を送らないため
+    let pending: Vec<ExpectedLine> = draft
+        .lines
+        .iter()
+        .filter(|l| l.action != DraftAction::Unchanged)
+        .map(|l| ExpectedLine {
+            work_date: l.work_date.clone(),
+            issue_key: l.issue_key.clone(),
+            action: l.action,
+            minutes: l.minutes,
+        })
+        .collect();
+    if pending != expected {
+        return Err(CHANGED_SINCE_CONFIRM.into());
+    }
+    // 作り直しの確認に使う自分のユーザー名（作成するものがあるときだけ取る）
+    let me = if pending.iter().any(|l| l.action == DraftAction::Create) {
+        Some(api.myself().await?.name)
+    } else {
+        None
     };
     let mut results = Vec::new();
     for line in draft
@@ -306,10 +396,7 @@ pub async fn send_draft<J: JiraApi>(
         .filter(|l| l.action != DraftAction::Unchanged)
     {
         let outcome: Result<(), String> = match line.action {
-            DraftAction::Create => match api
-                .add_worklog(&line.issue_key, &line.work_date, line.minutes)
-                .await
-            {
+            DraftAction::Create => match create_once(api, me.as_deref(), &line).await {
                 Ok(id) => record(conn, |c| {
                     jira_service::record_sent(
                         c,
@@ -361,6 +448,25 @@ pub async fn send_draft<J: JiraApi>(
     Ok(results)
 }
 
+pub const CHANGED_SINCE_CONFIRM: &str = "確認したあとに送る内容が変わりました（AI などで工数が変わった可能性があります）。内容を確認し直してから送ってください";
+
+/// 作業記録を作る。前回の送信で作れていたのに応答が届かなかったもの（同じ記録がすでにある）は、作らずにその id を使う
+async fn create_once<J: JiraApi>(
+    api: &J,
+    me: Option<&str>,
+    line: &jira_service::DraftLine,
+) -> Result<String, String> {
+    if let Some(me) = me
+        && let Some(id) = api
+            .find_worklog(&line.issue_key, me, &line.work_date, line.minutes)
+            .await?
+    {
+        return Ok(id);
+    }
+    api.add_worklog(&line.issue_key, &line.work_date, line.minutes)
+        .await
+}
+
 fn record(
     conn: &Mutex<Connection>,
     f: impl FnOnce(&Connection) -> crate::service::ServiceResult<()>,
@@ -383,6 +489,8 @@ mod tests {
     struct FakeJira {
         calls: RefCell<Vec<String>>,
         fail_key: Option<String>,
+        /// Jira 側にすでにある作業記録（課題, 日付, 分, id）。作成の応答が届かなかった状況を表す
+        existing: Vec<(String, String, i64, String)>,
     }
 
     impl JiraApi for FakeJira {
@@ -419,6 +527,46 @@ mod tests {
             self.calls.borrow_mut().push(format!("delete {key} {id}"));
             Ok(())
         }
+        async fn find_worklog(
+            &self,
+            key: &str,
+            author: &str,
+            d: &str,
+            m: i64,
+        ) -> Result<Option<String>, String> {
+            assert_eq!(author, "me");
+            Ok(self
+                .existing
+                .iter()
+                .find(|(k, date, min, _)| k == key && date == d && *min == m)
+                .map(|(_, _, _, id)| id.clone()))
+        }
+    }
+
+    /// 画面と同じく、いまの下書きを確認した内容として送る
+    fn send(jira: &FakeJira, conn: &Mutex<Connection>) -> Result<Vec<SendResult>, String> {
+        let expected: Vec<ExpectedLine> = {
+            let c = conn.lock().unwrap();
+            jira_service::build_draft(&c, "2026-11-16", "2026-11-22")
+                .unwrap()
+                .lines
+                .into_iter()
+                .filter(|l| l.action != DraftAction::Unchanged)
+                .map(|l| ExpectedLine {
+                    work_date: l.work_date,
+                    issue_key: l.issue_key,
+                    action: l.action,
+                    minutes: l.minutes,
+                })
+                .collect()
+        };
+        block(send_draft(
+            jira,
+            conn,
+            "2026-11-16",
+            "2026-11-22",
+            &expected,
+        ))
     }
 
     fn setup() -> (Mutex<Connection>, i64, i64) {
@@ -469,15 +617,15 @@ mod tests {
         let (conn, a, b) = setup();
         day(&conn, 480, &[(a, 1.0), (b, 1.0)]);
         let jira = FakeJira::default();
-        let r = block(send_draft(&jira, &conn, "2026-11-16", "2026-11-22")).unwrap();
+        let r = send(&jira, &conn).unwrap();
         assert_eq!(r.len(), 2);
         assert!(r.iter().all(|x| x.error.is_none()));
         // 2 回目は何も送らない
-        let r = block(send_draft(&jira, &conn, "2026-11-16", "2026-11-22")).unwrap();
+        let r = send(&jira, &conn).unwrap();
         assert!(r.is_empty());
         // B を外すと A は更新、B は削除
         day(&conn, 480, &[(a, 1.0)]);
-        block(send_draft(&jira, &conn, "2026-11-16", "2026-11-22")).unwrap();
+        send(&jira, &conn).unwrap();
         assert_eq!(
             *jira.calls.borrow(),
             [
@@ -497,7 +645,7 @@ mod tests {
             fail_key: Some("ABC-2".into()),
             ..Default::default()
         };
-        let r = block(send_draft(&jira, &conn, "2026-11-16", "2026-11-22")).unwrap();
+        let r = send(&jira, &conn).unwrap();
         let errors: Vec<_> = r
             .iter()
             .filter(|x| x.error.is_some())
@@ -518,6 +666,61 @@ mod tests {
                 ("ABC-1", DraftAction::Unchanged),
                 ("ABC-2", DraftAction::Create)
             ]
+        );
+    }
+
+    /// 前回の作成が Jira に届いていたのに応答が来なかった：同じ記録を見つけて使い、二重に作らない
+    #[test]
+    fn create_reuses_worklog_that_already_exists() {
+        let (conn, a, _) = setup();
+        day(&conn, 480, &[(a, 1.0)]);
+        let jira = FakeJira {
+            existing: vec![("ABC-1".into(), "2026-11-20".into(), 480, "w-lost".into())],
+            ..Default::default()
+        };
+        let r = send(&jira, &conn).unwrap();
+        assert!(r.iter().all(|x| x.error.is_none()));
+        assert!(jira.calls.borrow().is_empty(), "{:?}", jira.calls.borrow());
+        let id: String = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT worklog_id FROM jira_worklog", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, "w-lost");
+    }
+
+    /// 確認したあとに工数が変わったら、何も送らない
+    #[test]
+    fn refuses_when_draft_changed_after_confirmation() {
+        let (conn, a, b) = setup();
+        day(&conn, 480, &[(a, 1.0)]);
+        let jira = FakeJira::default();
+        let stale = vec![ExpectedLine {
+            work_date: "2026-11-20".into(),
+            issue_key: "ABC-1".into(),
+            action: DraftAction::Create,
+            minutes: 480,
+        }];
+        // 確認のあとに B にも振り分けた
+        day(&conn, 480, &[(a, 1.0), (b, 1.0)]);
+        let err = block(send_draft(&jira, &conn, "2026-11-16", "2026-11-22", &stale)).unwrap_err();
+        assert_eq!(err, CHANGED_SINCE_CONFIRM);
+        assert!(jira.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyring_user_is_per_url() {
+        assert_eq!(
+            keyring_user("https://Jira.Example.com/").unwrap(),
+            "jira_pat:https://jira.example.com:443"
+        );
+        assert_eq!(
+            keyring_user("http://127.0.0.1:8798").unwrap(),
+            "jira_pat:http://127.0.0.1:8798"
+        );
+        assert_ne!(
+            keyring_user("https://jira.example.com").unwrap(),
+            keyring_user("https://evil.example.com").unwrap()
         );
     }
 

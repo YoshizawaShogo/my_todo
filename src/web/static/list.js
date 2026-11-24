@@ -20,7 +20,7 @@ const LIST_DEFAULT = {
 };
 
 const list = {
-  filter: { ...LIST_DEFAULT, ...load_json("list_filter", {}) },
+  filter: structuredClone({ ...LIST_DEFAULT, ...load_json("list_filter", {}) }),
   views: load_json("list_views", []), // 保存した条件 [{name, filter}]
 };
 
@@ -51,8 +51,9 @@ const PRESETS = [
   ["すべて", { statuses: [], dateField: "plan", range: "all", group: "none", sortKey: "created_at", sortDir: "desc" }],
 ];
 
+// 条件は配列（状態・タグ）を持つので、必ず複製して渡す（共有したまま push すると既定やプリセット自体が変わる）
 function preset_filter(p) {
-  return { ...LIST_DEFAULT, ...p };
+  return structuredClone({ ...LIST_DEFAULT, ...p });
 }
 
 function save_list_filter() {
@@ -313,6 +314,7 @@ function list_row(t, today) {
   }, t.title);
   const nameCell = el("td", { class: "col_title" },
     el("div", { class: "title_line" }, title,
+      ...link_mark(t),
       ...tag_chips(t.tags, (n) => list.filter.tags.some((x) => same_tag(x, n)), (n) => { toggle_in(list.filter.tags, n); list.filter.untagged = false; save_list_filter(); })),
     el("div", { class: "crumb" }, path.length ? path.join(" › ") : t.is_inbox ? "未分類" : ""));
 
@@ -356,12 +358,12 @@ function render_list_controls(f) {
     class: "preset" + (same_filter(f, preset_filter(p)) ? " active" : ""),
     onclick: () => {
       // キーワード・タグ・場所はそのまま残す
-      list.filter = { ...preset_filter(p), text: f.text, tags: f.tags, tagMode: f.tagMode, untagged: f.untagged, section: f.section, parentId: f.parentId };
+      list.filter = structuredClone({ ...preset_filter(p), text: f.text, tags: f.tags, tagMode: f.tagMode, untagged: f.untagged, section: f.section, parentId: f.parentId });
       save_list_filter();
     },
   }, name));
   const saved = list.views.map((v, i) => el("span", { class: "preset saved" + (JSON.stringify(v.filter) === JSON.stringify(f) ? " active" : "") },
-    el("button", { type: "button", class: "preset_name", onclick: () => { list.filter = { ...LIST_DEFAULT, ...v.filter }; save_list_filter(); } }, "★ " + v.name),
+    el("button", { type: "button", class: "preset_name", onclick: () => { list.filter = structuredClone({ ...LIST_DEFAULT, ...v.filter }); save_list_filter(); } }, "★ " + v.name),
     el("button", {
       type: "button",
       class: "remove",
@@ -406,7 +408,7 @@ function render_list_controls(f) {
 
   $("lf_tags").replaceChildren(
     // 「タグなし」とタグの選択は同時に成り立たないので、片方を選ぶともう片方を外す
-    ...tag_filter_buttons(f.tags, (n) => { toggle_in(f.tags, n); f.untagged = false; save_list_filter(); }),
+    ...tag_filter_buttons(() => list.filter.tags, (n) => { toggle_in(list.filter.tags, n); list.filter.untagged = false; save_list_filter(); }),
     el("button", {
       type: "button",
       class: "chip" + (f.untagged ? " active" : ""),
@@ -457,7 +459,7 @@ function setup_list() {
   $("lf_section").addEventListener("change", (ev) => { f().section = ev.target.value; save_list_filter(); });
   $("lf_parent").addEventListener("change", (ev) => { f().parentId = ev.target.value ? Number(ev.target.value) : null; save_list_filter(); });
   $("lf_group").addEventListener("change", (ev) => { f().group = ev.target.value; save_list_filter(); });
-  $("lf_reset").addEventListener("click", () => { list.filter = { ...LIST_DEFAULT }; save_list_filter(); });
+  $("lf_reset").addEventListener("click", () => { list.filter = structuredClone(LIST_DEFAULT); save_list_filter(); });
   $("lf_save").addEventListener("click", () => {
     const name = prompt("この条件に名前を付けて保存します", "")?.trim();
     if (!name) return;

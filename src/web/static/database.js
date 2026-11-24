@@ -62,12 +62,29 @@ function draw_db_panel() {
           },
         }, "×"))))
       : el("p", { class: "empty_hint" }, "ほかに開いたファイルはありません"),
+    ...(info.can_pick ? [
+      el("div", { class: "db_label" }, "エクスプローラーで選ぶ"),
+      el("div", { class: "db_open_row" },
+        el("button", {
+          type: "button",
+          class: "small_button",
+          title: "ファイルを開く画面で選ぶ（ないファイル名を入れると新しく作れます）",
+          onclick: pick_database,
+        }, "📂 ファイルを選んで開く…")),
+    ] : []),
     el("div", { class: "db_label" }, "場所を指定して開く"),
     el("div", { class: "db_open_row" },
       input,
       el("button", { type: "button", class: "small_button primary", onclick: () => open_database(input.value) }, "開く")),
   );
   if (hadFocus) input.focus();
+}
+
+/// エクスプローラーの画面（Windows のファイルを開くダイアログ）で選んで開く
+async function pick_database() {
+  toast("ファイルを選ぶ画面を開きました（見当たらなければタスクバーを確認してください）");
+  const r = await api("POST", "/databases/pick");
+  if (r.path) await open_database(r.path);
 }
 
 /// 別のデータベースに切り替える。ファイルがなければ、新しく作るか聞く
@@ -98,6 +115,15 @@ function after_database_switch() {
   state.selectedId = null;
   state.selected = new Set();
   state.anchorId = null;
+  // 切り取り・コピーと折りたたみはタスクの id で覚えている。別のデータベースでは同じ id が別のタスクなので忘れる
+  clip.mode = null;
+  clip.ids = [];
+  clip.text = "";
+  state.collapsed = new Set();
+  gantt.pinned.clear();
+  save_json("collapsed", []);
+  tpl.list = [];
+  if (tpl.open) toggle_template_panel(false);
   pendingAdd = null;
   jira.config = null;
   jira.draft = null;

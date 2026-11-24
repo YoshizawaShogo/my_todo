@@ -60,7 +60,12 @@ fn ymd(d: Date) -> String {
 
 /// 週は月曜始まり・日曜終わり
 fn week_end_of(d: Date) -> Date {
-    d + (6 - i64::from(d.weekday().to_monday_zero_offset())).days()
+    add_days_saturating(d, 6 - i64::from(d.weekday().to_monday_zero_offset()))
+}
+
+/// 9999-12-31 を超えるときは 9999-12-31 で止める（パニックさせない）
+fn add_days_saturating(d: Date, n: i64) -> Date {
+    d.checked_add(n.days()).unwrap_or(Date::MAX)
 }
 
 pub fn agenda(conn: &Connection, today: Date) -> ServiceResult<Agenda> {
@@ -82,7 +87,7 @@ pub fn build_agenda(tasks: &[Task], today: Date) -> Agenda {
     };
 
     let week_end = week_end_of(today);
-    let next_week_end = week_end + 7.days();
+    let next_week_end = add_days_saturating(week_end, 7);
     let mut agenda = Agenda {
         today: ymd(today),
         week_end: ymd(week_end),

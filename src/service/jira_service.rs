@@ -24,18 +24,33 @@ pub fn get_config(conn: &Connection) -> ServiceResult<JiraConfig> {
     })
 }
 
-pub fn set_base_url(conn: &Connection, url: &str) -> ServiceResult<JiraConfig> {
-    let url = url.trim().trim_end_matches('/');
-    // PAT を平文で流さないよう、http:// はこの PC の中（localhost・127.0.0.1）だけに限る
-    let local_http = url
-        .strip_prefix("http://")
-        .and_then(|rest| rest.split(['/', ':']).next())
-        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1"));
-    if !(url.is_empty() || url.starts_with("https://") || local_http) {
-        return Err(ServiceError::Invalid(
+/// PAT を平文で流さないよう、https:// だけを受け付ける（http:// はこの PC の中だけ）。
+/// 文字列の先頭で判断すると `http://localhost:1@evil.example.com` のような形をすり抜けるので、
+/// URL として読んだうえでホスト名を見る。ユーザー名・パスワード入りの URL は受け付けない
+fn check_base_url(url: &str) -> ServiceResult<()> {
+    let invalid =
+        |why: &str| ServiceError::Invalid(format!("Jira の URL が正しくありません：{why}"));
+    let parsed = reqwest::Url::parse(url).map_err(|e| invalid(&e.to_string()))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("ユーザー名やパスワードは URL に入れないでください"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid("ホスト名がありません"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if matches!(host, "localhost" | "127.0.0.1") => Ok(()),
+        _ => Err(ServiceError::Invalid(
             "Jira の URL は https:// から始めてください（PAT が暗号化されずに流れるのを防ぐため）"
                 .into(),
-        ));
+        )),
+    }
+}
+
+pub fn set_base_url(conn: &Connection, url: &str) -> ServiceResult<JiraConfig> {
+    let url = url.trim().trim_end_matches('/');
+    if !url.is_empty() {
+        check_base_url(url)?;
     }
     super::set_setting(conn, SettingKey::JiraBaseUrl, url)?;
     get_config(conn)
@@ -348,5 +363,11 @@ mod tests {
         assert!(set_base_url(&conn, "jira.example.com").is_err());
         assert!(set_base_url(&conn, "http://jira.example.com").is_err());
         assert!(set_base_url(&conn, "http://127.0.0.1:8798").is_ok());
+        // ホスト名の前に localhost を置いてもすり抜けない
+        assert!(set_base_url(&conn, "http://localhost:1@evil.example.com").is_err());
+        assert!(set_base_url(&conn, "http://localhost.evil.example.com").is_err());
+        assert!(set_base_url(&conn, "https://user:pass@jira.example.com").is_err());
+        assert!(set_base_url(&conn, "ftp://jira.example.com").is_err());
+        assert!(set_base_url(&conn, "").is_ok());
     }
 }

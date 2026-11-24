@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{ServiceResult, Tx};
+use super::{ServiceError, ServiceResult, Tx};
 
 /// 元に戻せる操作の数の上限
 const MAX_STEPS: i64 = 200;
@@ -102,12 +102,57 @@ pub fn redo(conn: &Connection) -> ServiceResult<Option<String>> {
 }
 
 fn apply(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
+    match apply_step(conn, from) {
+        Err(ServiceError::Db(rusqlite::Error::SqliteFailure(e, _)))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            // あとから別の変更（AI など）があって、もう打ち消せない（例：戻そうとした子の親が消されている）。
+            // 残すと、それより前の操作もずっと戻せなくなるので、このステップだけ履歴から外す
+            let tx = Tx::begin(conn)?;
+            let order = match from {
+                Stack::Undo => "DESC",
+                Stack::Redo => "ASC",
+            };
+            let top: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    &format!(
+                        "SELECT j.step, s.label FROM undo_journal j LEFT JOIN undo_step s ON s.step = j.step \
+                         WHERE j.stack = ?1 ORDER BY j.step {order} LIMIT 1"
+                    ),
+                    [from],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((step, _)) = top {
+                tx.execute(
+                    "DELETE FROM undo_journal WHERE stack = ?1 AND step = ?2",
+                    params![from, step],
+                )?;
+            }
+            tx.commit()?;
+            let label = top.and_then(|(_, l)| l).unwrap_or_else(|| "操作".into());
+            Err(ServiceError::Invalid(format!(
+                "「{label}」は、そのあとの別の変更と食い違うため{}ませんでした。この操作は履歴から外しました",
+                match from {
+                    Stack::Undo => "元に戻せ",
+                    Stack::Redo => "やり直せ",
+                }
+            )))
+        }
+        other => other,
+    }
+}
+
+fn apply_step(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
     // 元に戻すのは一番新しいステップ、やり直すのは一番最近に戻したステップ
     let order = match from {
         Stack::Undo => "DESC",
         Stack::Redo => "ASC",
     };
-    let step: Option<i64> = conn
+    // どのステップを戻すかは、書き込みのロックを取ってから決める（ロック待ちの間に別のプロセスが
+    // 変更すると、古い一覧で選んだステップを戻して新しい変更を上書きしてしまうため）
+    let tx = Tx::begin(conn)?;
+    let step: Option<i64> = tx
         .query_row(
             &format!(
                 "SELECT step FROM undo_journal WHERE stack = ?1 ORDER BY step {order} LIMIT 1"
@@ -120,7 +165,6 @@ fn apply(conn: &Connection, from: Stack) -> ServiceResult<Option<String>> {
         return Ok(None);
     };
 
-    let tx = Tx::begin(conn)?;
     // 打ち消しの途中では親子の順序が前後するので、外部キーの確認はコミット時に行う
     tx.pragma_update(None, "defer_foreign_keys", "ON")?;
     let statements: Vec<String> = {
@@ -161,6 +205,27 @@ mod tests {
     use crate::db;
     use crate::model::{MoveTarget, NewTask, Task, TaskPatch};
     use crate::service::task_service as ts;
+
+    /// 打ち消せないステップ（戻す子の親が、履歴に残らない形で消された）でも、
+    /// トランザクションが開きっぱなしにならず、そのステップだけ外れて前の操作は戻せる
+    #[test]
+    fn unundoable_step_is_dropped_and_connection_stays_usable() {
+        let conn = db::open_in_memory().unwrap();
+        let first = add(&conn, "先", None);
+        let p = add(&conn, "親", None);
+        let x = add(&conn, "子", Some(p.id));
+        record(&conn, "子の削除", |c| ts::delete_task(c, x.id)).unwrap();
+        // 別の経路で親が消された（履歴には残らない）
+        conn.execute("DELETE FROM task WHERE id = ?1", [p.id])
+            .unwrap();
+
+        let err = undo(&conn).unwrap_err().to_string();
+        assert!(err.contains("子の削除"), "{err}");
+        assert!(conn.is_autocommit(), "トランザクションが開いたまま");
+        // 次の Ctrl+Z はその前の操作へ進む
+        assert_eq!(undo(&conn).unwrap().as_deref(), Some("追加"));
+        assert!(ts::get_task(&conn, first.id).is_ok());
+    }
 
     fn add(conn: &Connection, title: &str, parent_id: Option<i64>) -> Task {
         record(conn, "追加", |c| {

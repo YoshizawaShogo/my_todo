@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -10,7 +13,7 @@ use crate::model::{MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, Ta
 use crate::service::agenda_service::{self, Agenda};
 use crate::service::template_service::{self, Template, TemplateSummary};
 use crate::service::work_service::{self, DaySummary, SaveDay, Settings, SettingsPatch, WorkDay};
-use crate::service::{ServiceError, task_service, undo_service};
+use crate::service::{ServiceError, link_service, task_service, undo_service};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -23,8 +26,15 @@ pub fn router() -> Router<AppState> {
         .route("/tasks/move_many", post(move_tasks))
         .route("/tasks/copy", post(copy_tasks))
         .route("/tasks/delete_many", post(delete_tasks))
+        .route("/tasks/add_tag", post(add_tag))
+        .route("/tags/rename", post(rename_tag))
         .route("/tasks/create_many", post(create_tasks))
         .route("/tasks/{id}/events", get(list_events))
+        .route("/tasks/{id}/links", post(add_link))
+        .route(
+            "/links/{id}",
+            axum::routing::patch(rename_link).delete(delete_link),
+        )
         .route("/agenda", get(get_agenda))
         .route("/tags", get(list_tags))
         .route("/work_days", get(list_work_days))
@@ -41,6 +51,7 @@ pub fn router() -> Router<AppState> {
         .route("/databases", get(list_databases))
         .route("/databases/open", post(open_database))
         .route("/databases/forget", post(forget_database))
+        .route("/databases/pick", post(pick_database))
         .route("/templates", get(list_templates).post(save_template))
         .route(
             "/templates/{id}",
@@ -49,6 +60,7 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_template),
         )
         .route("/templates/{id}/apply", post(apply_template))
+        .route("/bye", post(bye))
         .route("/undo", post(undo))
         .route("/redo", post(redo))
 }
@@ -162,6 +174,13 @@ async fn delete_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 画面が閉じられた（ページの pagehide から navigator.sendBeacon で届く）。
+/// しばらくだれもつながってこなければアプリを終える
+async fn bye(State(s): State<AppState>) -> StatusCode {
+    s.activity.closed();
+    StatusCode::NO_CONTENT
+}
+
 #[derive(serde::Serialize)]
 struct UndoResult {
     /// 元に戻した（やり直した）操作の名前。何もなければ null
@@ -258,13 +277,14 @@ fn jira_client(s: &AppState) -> Result<DataCenterClient, String> {
         .map_err(|e| e.0.to_string())?
         .base_url
         .ok_or("Jira の URL が設定されていません（Jira タブで設定）")?;
-    let (token, _) = jira::load_token().ok_or("PAT が設定されていません（Jira タブで設定）")?;
+    let (token, _) = jira::load_token(Some(&base))
+        .ok_or("この URL 用の PAT が設定されていません（Jira タブで設定）")?;
     DataCenterClient::new(&base, &token)
 }
 
 async fn get_jira(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let config = with_conn(&s, jira_service::get_config)?;
-    let source = jira::load_token().map(|(_, src)| src);
+    let source = jira::load_token(config.base_url.as_deref()).map(|(_, src)| src);
     Ok(Json(
         json!({ "base_url": config.base_url, "token_source": source }),
     ))
@@ -283,8 +303,12 @@ async fn update_jira(State(s): State<AppState>, Json(p): Json<JiraConfigPatch>) 
     {
         return e.into_response();
     }
+    let base_url = match with_conn(&s, jira_service::get_config) {
+        Ok(c) => c.base_url,
+        Err(e) => return e.into_response(),
+    };
     if let Some(token) = &p.token
-        && let Err(e) = jira::save_token(token)
+        && let Err(e) = jira::save_token(base_url.as_deref(), token)
     {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
     }
@@ -328,8 +352,24 @@ async fn get_jira_draft(
     with_conn(&s, |c| jira_service::build_draft(c, &q.from, &q.to)).map(Json)
 }
 
-async fn send_jira(State(s): State<AppState>, Json(q): Json<RangeQuery>) -> Response {
-    use std::sync::atomic::Ordering;
+#[derive(serde::Deserialize)]
+struct SendRequest {
+    from: String,
+    to: String,
+    /// 画面で確認した送る内容（作り直した下書きと食い違ったら送らない）
+    expected: Vec<jira::ExpectedLine>,
+}
+
+/// 送信中の印。送り終えたら（途中で失敗・パニックしても）必ず下ろす
+struct SendingGuard(Arc<AtomicBool>);
+
+impl Drop for SendingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn send_jira(State(s): State<AppState>, Json(q): Json<SendRequest>) -> Response {
     let client = match jira_client(&s) {
         Ok(c) => c,
         Err(e) => return jira_error(e),
@@ -345,11 +385,21 @@ async fn send_jira(State(s): State<AppState>, Json(q): Json<RangeQuery>) -> Resp
         )
             .into_response();
     }
-    let result = jira::send_draft(&client, &s.conn, &q.from, &q.to).await;
-    s.jira_sending.store(false, Ordering::SeqCst);
-    match result {
-        Ok(results) => Json(results).into_response(),
-        Err(e) => jira_error(e),
+    let guard = SendingGuard(s.jira_sending.clone());
+    // 画面を閉じる・読み直すと、この要求の処理は途中で打ち切られる。送信と記録が途中で止まると
+    // 二重送信のもとになるので、別のタスクで最後まで送る
+    let conn = s.conn.clone();
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        jira::send_draft(&client, &conn, &q.from, &q.to, &q.expected).await
+    });
+    match task.await {
+        Ok(Ok(results)) => Json(results).into_response(),
+        Ok(Err(e)) if e == jira::CHANGED_SINCE_CONFIRM => {
+            (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response()
+        }
+        Ok(Err(e)) => jira_error(e),
+        Err(e) => jira_error(format!("送信が途中で止まりました: {e}")),
     }
 }
 
@@ -397,7 +447,28 @@ async fn list_databases(State(s): State<AppState>) -> Json<serde_json::Value> {
         current: config::normalize(p) == current,
     };
     let recent: Vec<DbEntry> = Config::load().recent_dbs.iter().map(|p| entry(p)).collect();
-    Json(json!({ "current": entry(&current), "recent": recent }))
+    // can_pick：エクスプローラーの画面でファイルを選べるか（Windows だけ）
+    Json(json!({ "current": entry(&current), "recent": recent, "can_pick": cfg!(windows) }))
+}
+
+/// エクスプローラーの画面（ファイルを開くダイアログ）でデータベースを選ぶ。選んだ場所を返すだけで、開くのは画面側
+async fn pick_database(State(s): State<AppState>) -> Response {
+    static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if PICKING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "ファイルを選ぶ画面がすでに開いています（タスクバーを確認してください）" })),
+        )
+            .into_response();
+    }
+    let current = current_db(&s);
+    // ダイアログは閉じるまで戻らないので、非同期の処理を止めないよう別のスレッドで出す
+    let picked =
+        tokio::task::spawn_blocking(move || crate::file_dialog::pick_database(Some(&current)))
+            .await;
+    PICKING.store(false, std::sync::atomic::Ordering::SeqCst);
+    let path = picked.ok().flatten().map(|p| plain_path(&p));
+    Json(json!({ "path": path })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -601,6 +672,47 @@ async fn create_tasks(
 }
 
 #[derive(serde::Deserialize)]
+struct AddTag {
+    ids: Vec<i64>,
+    tag: String,
+}
+
+#[derive(serde::Serialize)]
+struct AddTagResult {
+    /// タグが新しく付いた件数（すでに付いていたものは数えない）
+    changed: usize,
+}
+
+/// 複数のタスクにタグを 1 つ足す（タグをタスクへドラッグしたとき。1 回の操作として元に戻せる）
+async fn add_tag(State(s): State<AppState>, Json(req): Json<AddTag>) -> ApiResult<AddTagResult> {
+    let label = format!("タグ「{}」を {} 件に追加", req.tag.trim(), req.ids.len());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| task_service::add_tag(c, &req.ids, &req.tag))
+    })
+    .map(|changed| Json(AddTagResult { changed }))
+}
+
+#[derive(serde::Deserialize)]
+struct RenameTag {
+    from: String,
+    to: String,
+}
+
+/// タグの名前を変える（すべてのタスクで。1 回の操作として元に戻せる）
+async fn rename_tag(
+    State(s): State<AppState>,
+    Json(req): Json<RenameTag>,
+) -> ApiResult<AddTagResult> {
+    let label = format!("タグ「{}」を「{}」に変更", req.from.trim(), req.to.trim());
+    with_conn(&s, |c| {
+        undo_service::record(c, &label, |c| {
+            task_service::rename_tag(c, &req.from, &req.to)
+        })
+    })
+    .map(|changed| Json(AddTagResult { changed }))
+}
+
+#[derive(serde::Deserialize)]
 struct DeleteMany {
     ids: Vec<i64>,
 }
@@ -613,6 +725,67 @@ async fn delete_tasks(
     let label = format!("{} 件の削除", req.ids.len());
     with_conn(&s, |c| {
         undo_service::record(c, &label, |c| task_service::delete_tasks(c, &req.ids))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- 関連資料 ----------
+
+#[derive(serde::Deserialize)]
+struct NewLink {
+    url: String,
+    /// 省略するとリンク先のページの名前（取れなければホスト名とパス）
+    title: Option<String>,
+}
+
+/// 関連資料を足す。名前はリンク先のページから取る（データベースのロックは取らずに通信する）
+async fn add_link(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<NewLink>,
+) -> ApiResult<Task> {
+    let url = link_service::normalize_url(&req.url)?;
+    let title = match req.title.filter(|t| !t.trim().is_empty()) {
+        Some(t) => t,
+        None => crate::link_title::fetch_title(&url)
+            .await
+            .unwrap_or_default(),
+    };
+    with_conn(&s, |c| {
+        undo_service::record(c, "関連資料の追加", |c| {
+            link_service::add_link(c, id, &url, &title)
+        })?;
+        task_service::get_task(c, id)
+    })
+    .map(Json)
+}
+
+#[derive(serde::Deserialize)]
+struct RenameLink {
+    title: String,
+}
+
+async fn rename_link(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<RenameLink>,
+) -> ApiResult<crate::model::TaskLink> {
+    with_conn(&s, |c| {
+        undo_service::record(c, "関連資料の名前の変更", |c| {
+            link_service::rename_link(c, id, &req.title)
+        })
+    })
+    .map(Json)
+}
+
+async fn delete_link(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    with_conn(&s, |c| {
+        undo_service::record(c, "関連資料の削除", |c| {
+            link_service::delete_link(c, id)
+        })
     })?;
     Ok(StatusCode::NO_CONTENT)
 }

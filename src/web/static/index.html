@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>my_todo</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -42,6 +42,7 @@
             <button type="button" class="small_button" id="gantt_prev">◀ 前の週</button>
             <button type="button" class="small_button" id="gantt_today">今日</button>
             <button type="button" class="small_button" id="gantt_next">次の週 ▶</button>
+            <span class="scale_switch" id="gantt_scale" title="表示する期間"></span>
             <span class="template_switch">
               <div class="template_panel" id="template_panel" hidden>
                 <section class="template_part">
@@ -247,12 +248,14 @@
       </div>
     </div>
 
-    <aside id="detail" class="detail" hidden>
+    <aside id="detail" class="detail">
       <div class="detail_header">
         <h2>詳細</h2>
         <button id="detail_close" class="icon_button" type="button" title="閉じる">✕</button>
       </div>
-      <label>タイトル<input id="detail_title" type="text"></label>
+      <p class="detail_empty" id="detail_empty">タスクを選ぶと、ここに詳細が出ます</p>
+      <div class="detail_body" id="detail_body" hidden>
+      <div class="field"><label for="detail_title">タイトル</label><input id="detail_title" type="text"></div>
       <div class="tag_editor">
         <span class="field_label">タグ</span>
         <div class="tag_box" id="detail_tag_box">
@@ -261,39 +264,47 @@
         </div>
         <datalist id="tag_options"></datalist>
       </div>
-      <label>状態
-        <select id="detail_status">
+      <div class="field"><label for="detail_status">状態</label><select id="detail_status">
           <option value="todo">未着手</option>
           <option value="doing">作業中</option>
           <option value="done">完了</option>
-        </select>
-      </label>
+        </select></div>
       <div class="date_pair">
-        <label>開始予定日<input id="detail_planned_start" type="date"></label>
-        <label>終了予定日<input id="detail_planned_end" type="date"></label>
-      </div>
-      <div class="jira_key_box">
-        <label>Jira 課題<input id="detail_jira_key" type="text" placeholder="例：ABC-123（工数をこの課題に送る）" autocomplete="off"></label>
-        <div class="jira_key_info" id="detail_jira_info"></div>
-      </div>
-      <div class="effort_box">
-        <label>見積もり<input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></label>
-        <div class="effort_actual" id="detail_actual"></div>
+        <div class="field"><label for="detail_planned_start">開始予定日</label><input id="detail_planned_start" type="date"></div>
+        <div class="field"><label for="detail_planned_end">終了予定日</label><input id="detail_planned_end" type="date"></div>
       </div>
       <fieldset class="next_action">
         <legend>次の予定</legend>
         <div class="next_action_inputs">
           <input id="detail_next_action_date" type="date" title="いつ">
-          <input id="detail_next_action" type="text" placeholder="何をする（例：課長にレビュー依頼）">
+          <input id="detail_next_action" type="text" placeholder="何をする">
         </div>
       </fieldset>
-      <label>メモ<textarea id="detail_note" rows="6"></textarea></label>
+      <div class="links_box">
+        <span class="field_label">関連資料</span>
+        <ul class="link_list" id="detail_links"></ul>
+        <input id="detail_link_input" type="url" placeholder="URL を貼り付け（名前は自動で付く）" autocomplete="off">
+      </div>
+      <div class="field"><label for="detail_note">メモ</label><textarea id="detail_note" rows="6"></textarea></div>
+      <!-- Jira 課題と見積もりは、線表では畳んでおく（詳細タブでは開いて出す） -->
+      <details class="detail_more" id="detail_more">
+        <summary>その他<span class="detail_more_summary" id="detail_more_summary"></span></summary>
+        <div class="jira_key_box">
+          <div class="field"><label for="detail_jira_key">Jira 課題</label><input id="detail_jira_key" type="text" placeholder="例：ABC-123（工数をこの課題に送る）" autocomplete="off"></div>
+          <div class="jira_key_info" id="detail_jira_info"></div>
+        </div>
+        <div class="effort_box">
+          <div class="field"><label for="detail_estimate">見積もり</label><input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></div>
+          <div class="effort_actual" id="detail_actual"></div>
+        </div>
+      </details>
       <details class="history">
         <summary>記録</summary>
         <p class="detail_meta" id="detail_meta"></p>
         <ol id="detail_history" class="history_list"></ol>
       </details>
       <button id="detail_delete" class="danger_button" type="button">🗑️ このタスクを削除</button>
+      </div>
     </aside>
   </main>
 

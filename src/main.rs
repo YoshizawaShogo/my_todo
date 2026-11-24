@@ -1,9 +1,15 @@
+// Windows では窓（コンソール）を出さないアプリとして作る。画面はブラウザで開き、
+// 画面を閉じると自動で終わる。エラーはダイアログで知らせる
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[macro_use]
 mod str_enum;
 
 mod config;
 mod db;
+mod file_dialog;
 mod jira;
+mod link_title;
 mod mcp;
 mod model;
 mod service;
@@ -25,6 +31,7 @@ const USAGE: &str = "\
                    同じ場所の my_todo.db。target/ 配下から起動したときはカレントディレクトリ）
   --port <PORT>    待ち受けポート（既定: 8765。127.0.0.1 のみ）
   --no_open        起動時にブラウザを開かない
+  --keep_running   画面を閉じても終了しない（既定は、閉じて 1 分ほどで終了する）
   -h, --help       この説明を表示する";
 
 #[derive(PartialEq)]
@@ -39,6 +46,7 @@ struct Options {
     db_path: Option<PathBuf>,
     port: u16,
     open_browser: bool,
+    keep_running: bool,
 }
 
 /// 既定は実行ファイルと同じ場所の my_todo.db。
@@ -65,6 +73,7 @@ fn parse_args() -> Result<Option<Options>> {
         db_path: None,
         port: 8765,
         open_browser: true,
+        keep_running: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -80,6 +89,7 @@ fn parse_args() -> Result<Option<Options>> {
                     .context("--port は数値で指定してください")?
             }
             "--no_open" => opts.open_browser = false,
+            "--keep_running" => opts.keep_running = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -99,14 +109,15 @@ fn resolve_db_path(opts: &Options) -> PathBuf {
 }
 
 fn main() {
-    // ダブルクリックで起動したとき、エラーや異常終了のメッセージが読めるように窓を閉じずに待つ
+    #[cfg(windows)]
+    win::attach_parent_console();
+    // 窓がないので、アプリ自体が終わってしまう異常（main スレッドの panic）はダイアログで知らせる。
+    // 要求ごとの処理（tokio のワーカー）の panic はアプリが続くので出さない
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
-        // 要求ごとの処理（tokio のワーカー）の panic はアプリが続くので待たない。
-        // 待つのはアプリ自体が終わる main スレッドの panic だけ
         if std::thread::current().name() == Some("main") {
-            pause_if_own_console();
+            show_error(&format!("my_todo が異常終了しました。\n\n{info}"));
         }
     }));
     let result = tokio::runtime::Runtime::new()
@@ -114,9 +125,21 @@ fn main() {
         .and_then(|rt| rt.block_on(run()));
     if let Err(e) = result {
         eprintln!("my_todo: エラー: {e:#}");
-        pause_if_own_console();
+        show_error(&format!("my_todo を起動できませんでした。\n\n{e:#}"));
         std::process::exit(1);
     }
+}
+
+/// エラーをダイアログで出す（Windows のみ）。AI（MCP）から起動されたときは、
+/// 相手のプロセスを止めないよう出さずに標準エラーだけにする
+fn show_error(msg: &str) {
+    if std::env::args().any(|a| a == "mcp") {
+        return;
+    }
+    #[cfg(windows)]
+    win::message_box(msg);
+    #[cfg(not(windows))]
+    let _ = msg;
 }
 
 async fn run() -> Result<()> {
@@ -134,24 +157,50 @@ async fn run() -> Result<()> {
         }
         Mode::Serve => {
             println!("my_todo: データベース {}", db_path.display());
-            web::serve(conn, db_path, opts.port, opts.open_browser).await
+            web::serve(
+                conn,
+                db_path,
+                opts.port,
+                opts.open_browser,
+                opts.keep_running,
+            )
+            .await
         }
     }
 }
 
-/// この窓（コンソール）を使っているのが自分だけ＝ダブルクリックで起動したときは、
-/// 閉じる前に Enter を待つ。コマンドプロンプトなどから起動したときは待たない
+/// Windows の API を呼ぶところ（ここだけ unsafe を許す）
 #[cfg(windows)]
-#[allow(unsafe_code)] // Windows の API（GetConsoleProcessList）を呼ぶため。引数は長さを合わせた配列だけ
-fn pause_if_own_console() {
-    use windows_sys::Win32::System::Console::GetConsoleProcessList;
-    let mut pids = [0u32; 2];
-    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
-    if count == 1 {
-        eprintln!("\nEnter キーを押すと閉じます。");
-        let _ = std::io::stdin().read_line(&mut String::new());
+#[allow(unsafe_code)]
+mod win {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+
+    /// 窓のないアプリなので、コマンドプロンプトから起動したときはその窓につないで文字（--help など）を出す。
+    /// AI（MCP）のように標準入出力を渡されたときは、つながずにそのまま使う
+    pub fn attach_parent_console() {
+        // SAFETY: 引数は定数だけ。戻り値のハンドルは比べるだけで使わない
+        let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if out.is_null() || out == INVALID_HANDLE_VALUE {
+            // SAFETY: 引数は定数だけ。失敗しても（親に窓がない）何もしないだけ
+            unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+        }
+    }
+
+    pub fn message_box(msg: &str) {
+        let text: Vec<u16> = msg.encode_utf16().chain([0]).collect();
+        let title: Vec<u16> = "my_todo".encode_utf16().chain([0]).collect();
+        // SAFETY: どちらも 0 で終わる UTF-16 の文字列で、呼んでいる間は生きている
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            )
+        };
     }
 }
-
-#[cfg(not(windows))]
-fn pause_if_own_console() {}
