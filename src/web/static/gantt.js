@@ -14,7 +14,7 @@ let GANTT_DAYS = 42; // 表示する日数。縮尺で変わる
 const gantt = {
   start: null, // 表示開始日（月曜, YYYY-MM-DD）
   scale: "weeks", // GANTT_SCALES のキー
-  filter: { text: "", tags: [], hideDone: false, ...load_json("gantt_filter", {}) },
+  filter: { text: "", tags: [], hideDone: false, mineOnly: false, ...load_json("gantt_filter", {}) },
   matched: new Set(), // 絞り込み条件に合う id
   shown: new Set(), // 出す id（条件に合うものと、その祖先）
   pinned: new Set(), // 絞り込み中に追加したタスク（条件に合わなくても、絞り込みを変えるまで出しておく）
@@ -104,8 +104,9 @@ function setup_gantt() {
     }
   });
   $("gfilter_hide_done").addEventListener("change", (ev) => { gantt.filter.hideDone = ev.target.checked; save_gantt_filter(); });
+  $("gfilter_mine_only").addEventListener("change", (ev) => { gantt.filter.mineOnly = ev.target.checked; save_gantt_filter(); });
   $("gfilter_clear").addEventListener("click", () => {
-    gantt.filter = { text: "", tags: [], hideDone: gantt.filter.hideDone };
+    gantt.filter = { text: "", tags: [], hideDone: gantt.filter.hideDone, mineOnly: gantt.filter.mineOnly };
     save_gantt_filter();
   });
 }
@@ -244,7 +245,8 @@ function compute_gantt_filter() {
   const walk = (t) => {
     let childShown = false;
     for (const c of children_of(t.id)) childShown = walk(c) || childShown;
-    const self = (gantt.matched.has(t.id) && !(gantt.filter.hideDone && t.status === "done")) || gantt.pinned.has(t.id);
+    const hidden = (gantt.filter.hideDone && t.status === "done") || (gantt.filter.mineOnly && t.kind === "external");
+    const self = (gantt.matched.has(t.id) && !hidden) || gantt.pinned.has(t.id);
     const show = self || childShown;
     if (show) gantt.shown.add(t.id);
     return show;
@@ -255,6 +257,19 @@ function compute_gantt_filter() {
 /// 絞り込みの条件に合わないのに、追加したばかりなので出しているタスクか
 function gantt_pinned_only(t) {
   return gantt.pinned.has(t.id) && !gantt.matched.has(t.id);
+}
+
+/// バーの説明に付ける、見積もりと 1 日あたりの重さ
+function load_tip(t) {
+  const l = task_load(t);
+  if (!l) return t.kind === "external" ? "" : "\n見積もりなし（太さは仮）";
+  return `\n見積もり ${fmt_hours(l.est)}（太さは見積もりの大きさ）` +
+    (too_heavy(t) ? `\n期間に収まりません（平日 ${l.days} 日 × ${fmt_hours(day_capacity())} を超える）` : "");
+}
+
+/// 他の人の作業の印（行の名前の横）
+function kind_badge(t) {
+  return t.kind === "external" ? [el("span", { class: "kind_badge", title: "他の人の作業（工数記録の候補に出ず、要確認にも出ない）" }, "他の人")] : [];
 }
 
 /// その印（行の名前の横）
@@ -273,6 +288,7 @@ function render_gantt_filter() {
   const input = $("gfilter_text");
   if (document.activeElement !== input) input.value = gantt.filter.text;
   $("gfilter_hide_done").checked = gantt.filter.hideDone;
+  $("gfilter_mine_only").checked = Boolean(gantt.filter.mineOnly);
   $("gfilter_clear").hidden = !gantt_filter_active();
 }
 
@@ -352,6 +368,11 @@ function render_gantt() {
   // 日付の見出しと背景（週末・週の区切り・今日の線）。縮尺が小さいときは週末・週の線を省き、月の線を引く
   const sc = gantt_scale();
   const fine = GANTT_DAY_W >= 8;
+  // 詰め込みすぎの期間に入っている日（見出しを赤くする）
+  const crowdedDays = new Map();
+  for (const p of overloaded_periods()) {
+    for (let d = p.start; d <= p.end; d = add_days(d, 1)) if (!crowdedDays.has(d)) crowdedDays.set(d, p);
+  }
   const days = el("div", { class: "gantt_days scale_" + gantt.scale + (GANTT_DAY_W < 20 ? " narrow" : ""), style: `width:${width}px` });
   const bg = el("div", { class: "gantt_bg", style: `left:var(--gantt_name_w);width:${width}px` });
   for (let i = 0; i < GANTT_DAYS; i++) {
@@ -360,10 +381,15 @@ function render_gantt() {
     const wd = weekday_of(d);
     const weekend = wd === 0 || wd === 6;
     const monthStart = dd === 1 || i === 0;
+    const period = crowdedDays.get(d);
+    const over = Boolean(period);
     const cell = el("div", {
-      class: "gantt_day" + (weekend && fine ? " weekend" : "") + (d === today ? " today" : "") + (monthStart ? " month_start" : ""),
+      class: "gantt_day" + (weekend && fine ? " weekend" : "") + (d === today ? " today" : "") + (monthStart ? " month_start" : "") + (over ? " overload" : ""),
       style: `left:${i * GANTT_DAY_W}px;width:${GANTT_DAY_W}px`,
-      title: short_date(d),
+      title: short_date(d) + (period
+        ? `\n${short_date(period.start)}〜${short_date(period.end)} に収めるタスクの残りが ${fmt_hours(Math.round(period.total))}、平日に入るのは ${fmt_hours(period.cap)}：` +
+          period.tasks.map((t) => `\n・${t.title}`).join("")
+        : ""),
     });
     // 月の見出し。1 年表示は幅が狭いので「1月」だけ（1 月は年を出す）。
     // 縮尺が小さいとき、最初の列が月の終わりなら、すぐ次の月の見出しと重なるので出さない
@@ -416,7 +442,146 @@ function render_gantt() {
   scroll.replaceChildren(grid);
   scroll.scrollLeft = keepLeft;
   scroll.scrollTop = keepTop;
+  draw_dependency_arrows(grid, rowsEl, ctx);
   render_inbox_pane();
+}
+
+// ---------- 依存関係の矢印 ----------
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs = {}) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+
+const ARROW_LEN = 7; // 矢印の先の長さ（px）
+const ARROW_HALF = 4; // 矢印の先の幅の半分
+
+/// 2 点を結ぶ線。横向きに出て、横向きに (x2, y2) に入る。
+/// 戻る向き（back）は、一度右へ出て行の間を左へ戻り、後のバーの始まりよりさらに左まで戻ってから、
+/// 左から入るはっきりした S 字にする（なだらかな曲線だとバーに重なって見づらいため）
+function curve_path(x1, y1, x2, y2, back = false) {
+  if (back) {
+    const k = 14;
+    const ym = (y1 + y2) / 2;
+    const xa = x2 - Math.max(16, GANTT_DAY_W); // 入る前に戻る位置
+    return `M ${x1} ${y1} C ${x1 + k} ${y1}, ${x1 + k} ${ym}, ${x1} ${ym} L ${xa} ${ym} ` +
+      `C ${xa - k} ${ym}, ${xa - k} ${y2}, ${xa} ${y2} L ${x2} ${y2}`;
+  }
+  const dx = Math.max(24, Math.abs(x2 - x1) / 2);
+  return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+}
+
+/// 右向きの矢印の先（先端が (x, y)）
+function arrow_head(x, y, cls) {
+  return svg("path", { d: `M ${x - ARROW_LEN} ${y - ARROW_HALF} L ${x} ${y} L ${x - ARROW_LEN} ${y + ARROW_HALF} z`, class: cls });
+}
+
+/// 先のタスクのバーの終わりから、後のタスクのバーの始まりへ矢印を引く。順番が逆なら赤
+function draw_dependency_arrows(grid, rowsEl, ctx) {
+  const rowY = new Map();
+  for (const r of rowsEl.querySelectorAll(".gantt_row[data-task_id]")) {
+    rowY.set(Number(r.dataset.task_id), r.offsetTop + r.offsetHeight / 2);
+  }
+  const layer = svg("svg", { class: "dep_layer", width: ctx.width, height: rowsEl.offsetHeight });
+  layer.style.left = "var(--gantt_name_w)";
+  layer.style.top = `${rowsEl.offsetTop}px`;
+  for (const { pre, post } of all_dependencies()) {
+    if (!rowY.has(pre.id) || !rowY.has(post.id)) continue;
+    const a = dep_dates(pre), b = dep_dates(post);
+    if (!a.end || !b.start) continue;
+    const broken = dependency_broken(pre, post);
+    const x1 = ctx.x_of(a.end) + GANTT_DAY_W;
+    // 同じ日に引き継ぐ（前が終わる日に後を始める）のは問題ないので、戻る線にしない
+    const x2 = broken ? ctx.x_of(b.start) : Math.max(ctx.x_of(b.start), x1);
+    // 線は矢印の先の付け根の真ん中で終え、その先に矢印の先を描く（線が矢印の先に重ならないように）
+    const y2 = rowY.get(post.id);
+    const group = svg("g", { class: "dep" + (broken ? " broken" : "") });
+    const path = svg("path", {
+      d: curve_path(x1, rowY.get(pre.id), x2 - ARROW_LEN, y2, broken),
+      class: "dep_line" + (broken ? " broken" : ""),
+    });
+    group.append(path, arrow_head(x2, y2, "dep_head" + (broken ? " broken" : "")));
+    const title = svg("title");
+    title.textContent = `「${pre.title}」が終わってから「${post.title}」` +
+      (broken ? "\n順番が逆です（先のタスクが終わる前に始まる予定）" : "") + "\nクリックでこのつながりを外す";
+    group.append(title);
+    group.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (post.status === "done") {
+        toast("完了したタスクの前のつながりは外せません（未完了に戻すと外せる）", "error");
+        return;
+      }
+      if (confirm(`「${pre.title}」→「${post.title}」のつながりを外しますか？`)) remove_dependency(pre.id, post.id);
+    });
+    layer.append(group);
+  }
+  grid.append(layer);
+}
+
+/// バーの端の外側の丸。ほかの行（線表・未分類）へドラッグして離すと、依存関係をつなぐ
+function dep_dot(t, side) {
+  const dot = el("span", {
+    class: `dep_dot ${side}`,
+    title: side === "right"
+      ? "ドラッグして、ほかのバーの左の丸（前）につなぐ（このタスクが終わってから、そのタスク）"
+      : "ドラッグして、ほかのバーの右の丸（後ろ）につなぐ（そのタスクが終わってから、このタスク）",
+  });
+  dot.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    ev.stopPropagation(); // バーの移動にしない
+    ev.preventDefault();
+    const layer = document.querySelector("#gantt .dep_layer");
+    const rect = dot.getBoundingClientRect();
+    const lrect = layer?.getBoundingClientRect();
+    const x0 = rect.left + rect.width / 2, y0 = rect.top + rect.height / 2;
+    const temp = layer ? svg("path", { class: "dep_line temp" }) : null;
+    if (temp) layer.append(temp);
+    // つなげるのは「後ろ（右の丸）→ 前（左の丸）」だけ。運んでいる間は反対側の丸だけを出す
+    const want = side === "right" ? "left" : "right";
+    document.body.classList.add("dep_linking", `want_${want}`);
+    dot.classList.add("dep_origin");
+    let target = null;
+    const dotAt = (e) => {
+      const d = document.elementFromPoint(e.clientX, e.clientY)?.closest?.(`.dep_dot.${want}`);
+      const row = d?.closest("[data-task_id]");
+      return d && row && Number(row.dataset.task_id) !== t.id ? d : null;
+    };
+    const move = (e) => {
+      const next = dotAt(e);
+      if (temp) {
+        // 反対側の丸の上では、線をその丸の中心にぴたりと付ける
+        let [bx, by] = [e.clientX, e.clientY];
+        if (next) { const r = next.getBoundingClientRect(); [bx, by] = [r.left + r.width / 2, r.top + r.height / 2]; }
+        const [a, b] = [[x0, y0], [bx, by]].map(([x, y]) => [x - lrect.left, y - lrect.top]);
+        temp.setAttribute("d", side === "right" ? curve_path(a[0], a[1], b[0], b[1]) : curve_path(b[0], b[1], a[0], a[1]));
+      }
+      if (next !== target) {
+        target?.classList.remove("dep_dot_target");
+        target?.closest("[data-task_id]")?.classList.remove("dep_target");
+        next?.classList.add("dep_dot_target");
+        next?.closest("[data-task_id]")?.classList.add("dep_target");
+        target = next;
+      }
+    };
+    const up = (e) => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      document.body.classList.remove("dep_linking", `want_${want}`);
+      dot.classList.remove("dep_origin");
+      temp?.remove();
+      target?.classList.remove("dep_dot_target");
+      target?.closest("[data-task_id]")?.classList.remove("dep_target");
+      const d = dotAt(e);
+      if (!d) return;
+      const id = Number(d.closest("[data-task_id]").dataset.task_id);
+      if (side === "right") add_dependency(t.id, id);
+      else add_dependency(id, t.id);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  });
+  return dot;
 }
 
 // ---------- 未分類ペイン ----------
@@ -477,6 +642,7 @@ function inbox_row(t, depth, hasKids) {
   if (t.planned_end) dates.push(`〜${short_date(t.planned_end)}`);
   row.append(twisty, check, label,
     ...pinned_note(t),
+    ...kind_badge(t),
     ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     ...(dates.length ? [el("span", { class: "date_chip" }, dates.join(" "))] : []),
@@ -524,6 +690,7 @@ function gantt_row(r, ctx) {
   const name = el("div", { class: "gantt_name", style: `padding-left:${8 + r.depth * 16}px` },
     twisty, check, label,
     ...pinned_note(t),
+    ...kind_badge(t),
     ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     el("span", { class: "row_actions" },
@@ -568,12 +735,17 @@ function gantt_row(r, ctx) {
   const hasSpan = Boolean(span.start && span.end && span.start <= span.end);
   if (hasSpan) {
     const bar = el("div", {
-      class: `bar own ${t.status}` + alertClass,
-      title: tip + (overdue ? "\n終了予定日を過ぎています" : alerts.late_start ? "\n開始予定日を過ぎても未着手です" : "") + "\nドラッグで移動、端をドラッグで期間を変更",
+      class: `bar own ${t.status}` + alertClass + (t.kind === "external" ? " other" : "") + ` load_${load_level(t)}` + (too_heavy(t) ? " too_heavy" : ""),
+      title: tip + load_tip(t) + (overdue ? "\n終了予定日を過ぎています" : alerts.late_start ? "\n開始予定日を過ぎても未着手です" : "") +
+        (done ? "\n完了したので日程は動かせません" : "\nドラッグで移動、端をドラッグで期間を変更"),
     });
-    // 表示範囲で切れている側には端のつまみを付けない
-    if (span.start >= start) bar.append(el("span", { class: "bar_handle left" }));
-    if (span.end <= end) bar.append(el("span", { class: "bar_handle right" }));
+    // 表示範囲で切れている側には端のつまみを付けない。完了したタスクは日程を動かせないので付けない
+    if (!done && span.start >= start) bar.append(el("span", { class: "bar_handle left" }));
+    if (!done && span.end <= end) bar.append(el("span", { class: "bar_handle right" }));
+    // つまみの外側の丸：ほかの行へドラッグすると依存関係をつなぐ（右の丸から＝このタスクが先、左の丸から＝このタスクが後）
+    // 完了したタスクの前（左の丸）にはつなげない（後ろにはつなげる）
+    bar.append(dep_dot(t, "right"));
+    if (!done) bar.append(dep_dot(t, "left"));
     place(bar, span.start, span.end);
   } else if (r.hasKids && subtree_span(t)) {
     // 親は子の範囲を出し、自分の終了日があれば ◆ を重ねる
@@ -585,7 +757,7 @@ function gantt_row(r, ctx) {
   } else if (span.start) {
     // 終わりが決まっていない：開始から今日まで（未来の開始なら 1 日分）を薄く出す
     const e = !done && today > span.start ? today : span.start;
-    place(el("div", { class: `bar ${t.status} open_end` + alertClass, title: tip + "\n終了予定日は未設定" + (alerts.late_start ? "\n開始予定日を過ぎています" : "") }), span.start, e);
+    place(el("div", { class: `bar ${t.status} open_end` + alertClass + (t.kind === "external" ? " other" : "") + ` load_${load_level(t)}`, title: tip + "\n終了予定日は未設定" + (alerts.late_start ? "\n開始予定日を過ぎています" : "") }), span.start, e);
   }
   if (t.next_action_date && !done) {
     mark("next" + (alerts.next_overdue ? " overdue" : ""), "▶", t.next_action_date,
@@ -593,11 +765,16 @@ function gantt_row(r, ctx) {
   }
   if (clipped.left) track.append(el("span", { class: "clip_left", title: "表示範囲より前に予定あり" }, "«"));
   if (clipped.right) track.append(el("span", { class: "clip_right", title: "表示範囲より後に予定あり" }, "»"));
-  if (!hasSpan) {
-    track.classList.add("creatable");
-    track.title = "横にドラッグして開始予定日と終了予定日を決める";
+  // 完了したタスクは日程を動かせない（バーの移動・期間の変更・新しく決めるのもしない）
+  if (done) {
+    track.classList.add("locked");
+  } else {
+    if (!hasSpan) {
+      track.classList.add("creatable");
+      track.title = "横にドラッグして開始予定日と終了予定日を決める";
+    }
+    attach_gantt_drag(track, t, hasSpan ? span : null, ctx);
   }
-  attach_gantt_drag(track, t, hasSpan ? span : null, ctx);
   row.append(track);
   return row;
 }

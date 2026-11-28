@@ -205,18 +205,18 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
     let today = super::today().to_string();
     let mut stmt = conn.prepare(
         "WITH span AS ( \
-           SELECT id, status, \
+           SELECT id, status, kind, \
              COALESCE(planned_start, substr(started_at, 1, 10)) AS s, \
              COALESCE(planned_end, CASE WHEN status = ?6 THEN substr(completed_at, 1, 10) END) AS e \
            FROM task \
          ) \
          SELECT task_id, CASE MIN(p) WHEN 1 THEN ?3 WHEN 2 THEN ?4 ELSE ?5 END, MAX(p) > 1 FROM ( \
            SELECT task_id, ?3 AS reason, 1 AS p FROM time_entry WHERE work_date = ?1 \
-           UNION ALL SELECT id, ?4, 2 FROM task WHERE substr(completed_at, 1, 10) = ?1 \
-           UNION ALL SELECT id, ?5, 3 FROM span WHERE \
+           UNION ALL SELECT id, ?4, 2 FROM task WHERE substr(completed_at, 1, 10) = ?1 AND kind = ?7 \
+           UNION ALL SELECT id, ?5, 3 FROM span WHERE kind = ?7 AND ( \
              (s IS NOT NULL AND e IS NOT NULL AND s <= ?1 AND e >= ?1) \
              OR (s IS NULL AND e = ?1) \
-             OR (e IS NULL AND s IS NOT NULL AND status != ?6 AND s <= ?1 AND ?1 <= ?2) \
+             OR (e IS NULL AND s IS NOT NULL AND status != ?6 AND s <= ?1 AND ?1 <= ?2)) \
          ) GROUP BY task_id ORDER BY MIN(p), task_id",
     )?;
     let suggestions = stmt
@@ -227,7 +227,8 @@ pub fn get_day(conn: &Connection, date: &str) -> ServiceResult<WorkDay> {
                 SuggestReason::Recorded,
                 SuggestReason::Completed,
                 SuggestReason::Planned,
-                TaskStatus::Done
+                TaskStatus::Done,
+                crate::model::TaskKind::Own
             ],
             |r| {
                 Ok(Suggestion {
@@ -445,6 +446,26 @@ mod tests {
             ),
             Err(ServiceError::NotFound(999))
         ));
+    }
+
+    /// 他の人の作業は、日程が重なっていても候補に出さない
+    #[test]
+    fn other_peoples_tasks_are_not_suggested() {
+        let conn = db::open_in_memory().unwrap();
+        let mine = add(&conn, "自分");
+        let theirs = add(&conn, "他の人");
+        for id in [mine, theirs] {
+            let p: TaskPatch = serde_json::from_str(
+                r#"{"planned_start":"2030-01-08","planned_end":"2030-01-12"}"#,
+            )
+            .unwrap();
+            ts::update_task(&conn, id, p).unwrap();
+        }
+        let p: TaskPatch = serde_json::from_str(r#"{"kind":"external"}"#).unwrap();
+        ts::update_task(&conn, theirs, p).unwrap();
+        let day = get_day(&conn, "2030-01-10").unwrap();
+        let ids: Vec<i64> = day.suggestions.iter().map(|s| s.task_id).collect();
+        assert_eq!(ids, [mine]);
     }
 
     /// 記録済みでも、線表で重なるものは「記録を消しても候補に残る」

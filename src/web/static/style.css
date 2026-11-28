@@ -757,7 +757,7 @@ body.drag_create, body.drag_create * { cursor: crosshair !important; }
 .work_row.zero .work_name .title { color: var(--muted); }
 .work_name { min-width: 0; display: flex; align-items: baseline; gap: 8px; cursor: pointer; overflow: hidden; white-space: nowrap; }
 .work_name .title { overflow: hidden; text-overflow: ellipsis; }
-.work_name .title.done { text-decoration: line-through; }
+
 .work_name .crumb { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .work_name .reason { flex: none; font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
 .work_slider { width: 100%; accent-color: var(--accent); }
@@ -890,7 +890,7 @@ body.drag_create, body.drag_create * { cursor: crosshair !important; }
 /* ---------- Jira タブ ---------- */
 .jira_section { padding: 8px 0 14px; }
 .jira_form { display: flex; flex-direction: column; gap: 10px; padding: 4px 16px 0; max-width: 560px; }
-.jira_form label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+.jira_form label, .jira_form .jira_field { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
 .jira_form input, .jira_key_box input {
   padding: 6px 8px;
   border: 1px solid var(--border);
@@ -1324,7 +1324,7 @@ body.tag_dragging .tag_chip { cursor: copy; }
 
 /* 詳細パネルの項目名：押せるのは項目名の文字だけ（横の空いた所を押しても入力欄に移らない） */
 .detail .field { display: flex; flex-direction: column; gap: 4px; }
-.detail .field > label { align-self: flex-start; }
+.detail .field > label, .detail .field > .field_label { align-self: flex-start; }
 
 /* 絞り込みの「解除」「条件をリセット」は、押せるボタンだとわかるように最初から枠を付ける */
 #gfilter_clear, #lf_reset { border-color: var(--border); color: var(--text); }
@@ -1363,3 +1363,141 @@ body.tag_dragging .tag_chip { cursor: copy; }
   pointer-events: none;
   z-index: 6;
 }
+
+/* ---------- 他の人の作業 ---------- */
+.kind_badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; margin-left: 4px; white-space: nowrap; }
+/* 他の人のバー：塗りつぶさず、斜線と枠線にする */
+.bar.other {
+  background: repeating-linear-gradient(135deg, var(--panel) 0 4px, var(--bar_todo) 4px 7px);
+  box-shadow: inset 0 0 0 1.5px var(--muted);
+}
+.bar.other.doing { background: repeating-linear-gradient(135deg, var(--panel) 0 4px, var(--accent) 4px 7px); }
+.bar.other.done { background: repeating-linear-gradient(135deg, var(--panel) 0 4px, var(--bar_done) 4px 7px); }
+.bar.other.overdue { box-shadow: inset 0 0 0 1.5px var(--muted), 0 0 0 2px var(--danger); }
+
+/* ---------- 依存関係 ---------- */
+.dep_layer { position: absolute; pointer-events: none; z-index: 1; overflow: hidden; }
+.dep_line { fill: none; stroke: var(--muted); stroke-width: 1.5; pointer-events: stroke; cursor: pointer; opacity: 0.8; }
+.dep_line:hover { stroke-width: 3; opacity: 1; }
+.dep_line.broken { stroke: var(--danger); stroke-width: 2; opacity: 1; }
+.dep_line.temp { stroke: var(--accent); stroke-dasharray: 4 3; pointer-events: none; }
+.dep_head { fill: var(--muted); pointer-events: all; cursor: pointer; }
+.dep_head.broken { fill: var(--danger); }
+.dep:hover .dep_line { stroke-width: 3; opacity: 1; }
+/* バーの端のつまみの外側の丸（行にカーソルを合わせたときだけ出す） */
+.dep_dot {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  box-sizing: border-box;
+  cursor: crosshair;
+  display: none;
+  z-index: 2;
+}
+.dep_dot.left { left: -15px; }
+.dep_dot.right { right: -15px; }
+.gantt_row:hover .dep_dot { display: block; }
+/* つないでいる間：反対側の丸だけを出して大きくする（後ろ同士・前同士はつなげない） */
+body.dep_linking .gantt_row .dep_dot { display: none; }
+body.dep_linking .gantt_row .dep_dot.dep_origin { display: block; }
+body.dep_linking.want_left .gantt_row .dep_dot.left, body.dep_linking.want_right .gantt_row .dep_dot.right {
+  display: block; width: 13px; height: 13px; margin-top: -6.5px;
+}
+body.dep_linking.want_left .dep_dot.left { left: -18px; }
+body.dep_linking.want_right .dep_dot.right { right: -18px; }
+.dep_dot.dep_dot_target { background: var(--accent); transform: scale(1.3); }
+/* 丸の周りも押せるようにして狙いやすくする */
+.dep_dot::after { content: ""; position: absolute; inset: -7px; border-radius: 50%; }
+.dep_dot:hover { background: var(--accent); }
+body.dep_linking, body.dep_linking * { cursor: crosshair !important; }
+.gantt_row.dep_target .gantt_name, .gantt_row.dep_target .gantt_track, .inbox_row.dep_target { background-color: var(--accent_soft); }
+#detail_deps_pre li.broken .link_title, #detail_deps_post li.broken .link_title { color: var(--danger); }
+.deps_post { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+
+/* 工数記録の行のまとまり */
+.work_group_title { display: flex; align-items: baseline; gap: 8px; margin: 12px 0 4px; font-weight: 600; font-size: 13px; }
+.work_group_title:first-child { margin-top: 4px; }
+.work_group_title .hint { font-weight: normal; font-size: 12px; color: var(--muted); }
+.work_group_title.warn .hint { color: var(--danger); }
+
+/* ---------- 振り返りタブ（左に一覧、右の欄に振り返り） ---------- */
+.review_section { padding: 12px 0 16px; }
+.review_toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 0 24px 8px; }
+.review_periods { display: flex; gap: 4px; }
+.review_toolbar .filter_text { width: 180px; }
+.review_toolbar #review_csv { margin-left: auto; border-color: var(--border); }
+.review_tags { padding: 0 24px 8px; }
+.review_tags:empty { display: none; }
+.review_summary { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 0 24px 10px; font-size: 13px; color: var(--muted); }
+.review_summary span { white-space: nowrap; }
+.review_head, .review_row { display: grid; grid-template-columns: 64px minmax(0, 1fr) 130px 64px 36px; gap: 8px; align-items: center; padding: 6px 24px; }
+.review_head { font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--frame); }
+.review_head span:nth-child(3), .review_head span:nth-child(4) { text-align: right; }
+.review_head span:nth-child(5) { text-align: center; }
+.review_list { max-height: max(240px, calc(90vh - 230px)); overflow-y: auto; }
+.review_row { border-bottom: 1px solid var(--row_line); cursor: pointer; }
+.review_row:hover { background: var(--row_hover); }
+.review_row.open { background: var(--row_selected); box-shadow: inset 3px 0 0 var(--accent); }
+.review_row .date { font-size: 12px; color: var(--muted); }
+.review_row .name { display: flex; flex-direction: column; min-width: 0; }
+.review_row .name .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review_row .name .crumb { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review_row .num { font-size: 13px; text-align: right; white-space: nowrap; }
+.ratio { font-size: 13px; text-align: right; font-weight: 600; }
+.ratio.ok { color: #2e8b57; }
+.ratio.over { color: var(--danger); }
+.ratio.under { color: var(--accent); }
+.review_row .review_mark { text-align: center; color: var(--muted); }
+.review_row .review_mark.done { color: var(--accent); }
+.review_pane_body { display: flex; flex-direction: column; gap: 8px; }
+.review_pane_meta { font-size: 12px; color: var(--muted); }
+.review_pane_numbers { display: flex; gap: 12px; align-items: baseline; font-size: 13px; flex-wrap: wrap; }
+.review_reasons { display: flex; flex-wrap: wrap; gap: 4px; }
+.review_note { width: 100%; box-sizing: border-box; }
+/* 振り返りの積み上げの棒（左：見積もり、右：実績） */
+.review_stack { display: flex; align-items: flex-end; gap: 10px; padding: 4px 0 8px; flex-wrap: wrap; }
+.stack_col { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; }
+.stack_total { font-size: 12px; font-weight: 600; }
+.stack_area { position: relative; width: 44px; display: flex; flex-direction: column; justify-content: flex-end; border-bottom: 1px solid var(--frame); }
+.stack_bar { display: flex; flex-direction: column-reverse; }
+.stack_seg { width: 44px; box-sizing: border-box; border-top: 1px solid var(--panel); }
+.stack_mark { position: absolute; left: -6px; right: -6px; border-top: 2px dashed var(--text); }
+.stack_label { font-size: 12px; color: var(--muted); }
+.stack_table { border-collapse: collapse; font-size: 12px; align-self: flex-start; margin-left: 8px; }
+/* 右の欄（幅が狭い）では、表は棒の下に幅いっぱいで出す */
+.review_pane .stack_table { width: 100%; margin: 6px 0 0; }
+.stack_table th, .stack_table td.num, .stack_table .diff { white-space: nowrap; }
+.stack_table th { font-weight: normal; color: var(--muted); text-align: left; padding: 2px 10px 2px 0; }
+.stack_table td { padding: 2px 10px 2px 0; }
+.stack_table td.num { text-align: right; }
+.stack_table .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.stack_table .diff.over { color: var(--danger); font-weight: 600; }
+.stack_table .diff.under { color: var(--accent); }
+.stack_table .note { color: var(--muted); padding-top: 4px; }
+
+/* ---------- 見積もりと負荷 ---------- */
+/* バーの太さ：1 日あたりの重さ（見積もり ÷ 期間の平日、1D に対する割合）。行の真ん中にそろえる */
+.bar.own.load_light, .bar.open_end.load_light { height: 6px; top: 12px; }
+.bar.own.load_medium, .bar.open_end.load_medium { height: 10px; top: 10px; }
+.bar.own.load_heavy, .bar.open_end.load_heavy { height: 16px; top: 7px; }
+/* 見積もりがない：太さは仮（普通）で、点線の枠 */
+.bar.own.load_unknown, .bar.open_end.load_unknown { height: 10px; top: 10px; outline: 1.5px dashed var(--muted); outline-offset: 1px; }
+/* 期間に収まらない */
+.bar.too_heavy { box-shadow: 0 0 0 2px var(--danger); }
+/* 詰め込みすぎの日：日付の見出しを赤く */
+.gantt_day.overload { background: rgba(198, 40, 40, 0.14); }
+.gantt_day.overload .dnum { color: var(--danger); font-weight: 700; }
+
+#detail_dates_more .date_pair { margin-bottom: 8px; }
+
+/* 完了したタスク：日程は動かせない */
+.gantt_track.locked, .gantt_track.locked .bar.own { cursor: default; }
+.locked_note { margin: 0; font-size: 12px; color: var(--muted); }
+.detail input:disabled, .detail select:disabled { opacity: 0.65; cursor: not-allowed; }
+.bar.own.load_other, .bar.open_end.load_other { height: 10px; top: 10px; }
+.detail .effort_box[hidden] { display: none; }

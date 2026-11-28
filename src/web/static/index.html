@@ -14,6 +14,7 @@
       <button type="button" class="tab" role="tab" data-tab="gantt">線表</button>
       <button type="button" class="tab" role="tab" data-tab="list">詳細</button>
       <button type="button" class="tab" role="tab" data-tab="work">工数記録</button>
+      <button type="button" class="tab" role="tab" data-tab="review">振り返り</button>
       <button type="button" class="tab" role="tab" data-tab="jira">Jira</button>
       <button type="button" class="tab" role="tab" data-tab="help">ヘルプ</button>
     </nav>
@@ -52,9 +53,9 @@
                 </section>
                 <section class="template_part">
                   <h3 class="template_heading">使う</h3>
-                  <label class="template_start_row">開始日
+                  <div class="template_start_row"><span>開始日</span>
                     <input type="date" id="template_start">
-                  </label>
+                  </div>
                   <p class="template_hint">一番早い日付がこの日になり、ほかの日付も同じ平日の数でずれます（土日は数えない）。作る場所は、選んでいるタスクの後ろ（なければ線表の末尾）</p>
                   <div id="template_list"></div>
                 </section>
@@ -76,6 +77,7 @@
             <input id="gfilter_text" class="filter_text" type="search" placeholder="絞り込み（キーワード）" autocomplete="off">
             <div id="gfilter_tags" class="filter_tags"></div>
             <label class="toggle"><input id="gfilter_hide_done" type="checkbox"> 完了を隠す</label>
+            <label class="toggle" title="他の人の作業を隠す"><input id="gfilter_mine_only" type="checkbox"> 自分の分だけ</label>
             <button id="gfilter_clear" class="small_button" type="button" hidden>解除</button>
           </div>
           <div class="gantt_scroll" id="gantt"></div>
@@ -158,6 +160,25 @@
         </section>
       </div>
 
+      <!-- 振り返り（左に一覧、右の欄に選んだタスクの振り返り） -->
+      <div class="view" id="view_review" hidden>
+        <section class="list_section review_section">
+          <div class="review_toolbar">
+            <div class="review_periods" id="review_periods"></div>
+            <input id="review_text" class="filter_text" type="search" placeholder="絞り込み（キーワード）" autocomplete="off">
+            <label class="toggle"><input id="review_unestimated" type="checkbox"> 見積もりなしも</label>
+            <label class="toggle"><input id="review_unreviewed" type="checkbox"> 未記入だけ</label>
+            <button type="button" class="small_button" id="review_csv" title="この期間の振り返りを CSV で書き出す（Excel や AI で処理できる）">CSV で書き出す</button>
+          </div>
+          <div class="review_tags filter_tags" id="review_tags"></div>
+          <div class="review_summary" id="review_summary"></div>
+          <div class="review_head">
+            <span>完了日</span><span>タスク</span><span>見積もり → 実績</span><span>倍率</span><span title="振り返りを書いたか">記入</span>
+          </div>
+          <div class="review_list" id="review_list"></div>
+        </section>
+      </div>
+
       <!-- 工数 -->
       <div class="view" id="view_work" hidden>
         <section class="list_section work_section">
@@ -201,8 +222,8 @@
         <section class="list_section jira_section">
           <h2 class="section_title">接続</h2>
           <div class="jira_form">
-            <label>Jira の URL<input id="jira_url" type="text" placeholder="https://jira.example.com" autocomplete="off"></label>
-            <label>PAT（個人用アクセストークン）<input id="jira_token" type="password" placeholder="新しく入れるときだけ" autocomplete="off"></label>
+            <div class="jira_field"><span>Jira の URL</span><input id="jira_url" type="text" placeholder="https://jira.example.com" autocomplete="off"></div>
+            <div class="jira_field"><span>PAT（個人用アクセストークン）</span><input id="jira_token" type="password" placeholder="新しく入れるときだけ" autocomplete="off"></div>
             <div class="jira_buttons">
               <button type="button" class="small_button primary" id="jira_save">保存</button>
               <button type="button" class="small_button" id="jira_test">接続テスト</button>
@@ -248,6 +269,10 @@
       </div>
     </div>
 
+    <aside id="review_pane" class="detail review_pane" hidden>
+      <div class="detail_header"><h2 id="review_pane_title">振り返り</h2></div>
+      <div id="review_pane_body"></div>
+    </aside>
     <aside id="detail" class="detail">
       <div class="detail_header">
         <h2>詳細</h2>
@@ -255,7 +280,8 @@
       </div>
       <p class="detail_empty" id="detail_empty">タスクを選ぶと、ここに詳細が出ます</p>
       <div class="detail_body" id="detail_body" hidden>
-      <div class="field"><label for="detail_title">タイトル</label><input id="detail_title" type="text"></div>
+      <div class="field"><span class="field_label">タイトル</span><input id="detail_title" type="text"></div>
+      <p class="locked_note" id="detail_locked" hidden>完了したタスクの名前・日程・見積もり・担当・次の予定・先に終わらせるタスクは変えられません（未完了に戻すと変えられる）</p>
       <div class="tag_editor">
         <span class="field_label">タグ</span>
         <div class="tag_box" id="detail_tag_box">
@@ -264,14 +290,27 @@
         </div>
         <datalist id="tag_options"></datalist>
       </div>
-      <div class="field"><label for="detail_status">状態</label><select id="detail_status">
-          <option value="todo">未着手</option>
-          <option value="doing">作業中</option>
-          <option value="done">完了</option>
-        </select></div>
       <div class="date_pair">
-        <div class="field"><label for="detail_planned_start">開始予定日</label><input id="detail_planned_start" type="date"></div>
-        <div class="field"><label for="detail_planned_end">終了予定日</label><input id="detail_planned_end" type="date"></div>
+        <div class="field"><span class="field_label">状態</span><select id="detail_status">
+            <option value="todo">未着手</option>
+            <option value="doing">作業中</option>
+            <option value="done">完了</option>
+          </select></div>
+        <div class="field"><span class="field_label">担当</span><select id="detail_kind" title="他の人の作業は、線表で見た目が変わり、工数記録の候補や要確認に出ない">
+            <option value="self">自分</option>
+            <option value="external">他の人</option>
+          </select></div>
+      </div>
+      <!-- 見積もりは上に出す（見積もる癖をつけるため） -->
+      <div class="effort_box">
+        <div class="field"><span class="field_label">見積もり</span><input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></div>
+      </div>
+      <!-- 開始予定日・終了予定日：詳細タブではここに出す。線表ではバーで決めるので「その他」に移す -->
+      <div id="detail_dates_main">
+        <div class="date_pair" id="detail_dates">
+          <div class="field"><span class="field_label">開始予定日</span><input id="detail_planned_start" type="date"></div>
+          <div class="field"><span class="field_label">終了予定日</span><input id="detail_planned_end" type="date"></div>
+        </div>
       </div>
       <fieldset class="next_action">
         <legend>次の予定</legend>
@@ -281,21 +320,25 @@
         </div>
       </fieldset>
       <div class="links_box">
+        <span class="field_label">先に終わらせるタスク</span>
+        <ul class="link_list" id="detail_deps_pre"></ul>
+        <input id="detail_dep_input" type="text" list="dep_options" placeholder="タスク名を入れて Enter" title="線表でバーの端の丸をドラッグしてもつなげる" autocomplete="off">
+        <datalist id="dep_options"></datalist>
+        <div class="deps_post" id="detail_deps_post"></div>
+      </div>
+      <div class="links_box">
         <span class="field_label">関連資料</span>
         <ul class="link_list" id="detail_links"></ul>
         <input id="detail_link_input" type="url" placeholder="URL を貼り付け（名前は自動で付く）" autocomplete="off">
       </div>
-      <div class="field"><label for="detail_note">メモ</label><textarea id="detail_note" rows="6"></textarea></div>
-      <!-- Jira 課題と見積もりは、線表では畳んでおく（詳細タブでは開いて出す） -->
+      <div class="field"><span class="field_label">メモ</span><textarea id="detail_note" rows="6"></textarea></div>
+      <!-- Jira 課題（と線表では開始・終了予定日）は畳んでおく（詳細タブでは開いて出す） -->
       <details class="detail_more" id="detail_more">
         <summary>その他<span class="detail_more_summary" id="detail_more_summary"></span></summary>
+        <div id="detail_dates_more"></div>
         <div class="jira_key_box">
-          <div class="field"><label for="detail_jira_key">Jira 課題</label><input id="detail_jira_key" type="text" placeholder="例：ABC-123（工数をこの課題に送る）" autocomplete="off"></div>
+          <div class="field"><span class="field_label">Jira 課題</span><input id="detail_jira_key" type="text" placeholder="例：ABC-123（工数をこの課題に送る）" autocomplete="off"></div>
           <div class="jira_key_info" id="detail_jira_info"></div>
-        </div>
-        <div class="effort_box">
-          <div class="field"><label for="detail_estimate">見積もり</label><input id="detail_estimate" type="text" placeholder="例：1d、4h、1.5d、30m"></div>
-          <div class="effort_actual" id="detail_actual"></div>
         </div>
       </details>
       <p class="detail_meta" id="detail_meta"></p>
@@ -321,6 +364,7 @@
   <script src="/alerts.js"></script>
   <script src="/clipboard.js"></script>
   <script src="/templates.js"></script>
+  <script src="/review.js"></script>
   <script>setup();</script>
 </body>
 </html>

@@ -145,7 +145,23 @@ function draw_work() {
   if (!work.rows.length) {
     box.replaceChildren(el("p", { class: "empty_hint" }, "この日に関わったタスクはありません。下の欄からタスクを追加してください。"));
   } else {
-    box.replaceChildren(...work.rows.map((r, i) => work_row(r, minutes[i], total)));
+    // 意味ごとにまとめて出す：この日に完了したもの（必ず振り分ける）／この日に予定があったもの（取り組んだものだけ）／ほか
+    const groups = [
+      { key: "completed", title: "この日に完了したタスク", hint: "完了したので、工数を振り分けてください" },
+      { key: "planned", title: "この日に予定があったタスク", hint: "線表でこの日に重なっているもの。取り組んだものだけ割合を付ける" },
+      { key: "other", title: "ほかに記録したタスク", hint: "" },
+    ];
+    const parts = [];
+    for (const g of groups) {
+      const items = work.rows.map((r, i) => [r, i]).filter(([r]) => work_group(r) === g.key);
+      if (!items.length) continue;
+      const missing = g.key === "completed" && items.some(([r]) => !(r.weight > 0));
+      parts.push(el("div", { class: "work_group_title" + (missing ? " warn" : "") },
+        el("span", {}, g.title),
+        el("span", { class: "hint" }, missing ? "まだ振り分けていないものがあります" : g.hint)));
+      parts.push(...items.map(([r, i]) => work_row(r, minutes[i], total)));
+    }
+    box.replaceChildren(...parts);
   }
   if (worked > 0 && total === 0 && work.rows.length) {
     box.append(el("p", { class: "empty_hint warn" }, "割合がすべて 0 です。スライダーで振り分けてください。"));
@@ -165,6 +181,14 @@ function draw_work() {
   const sd = $("setting_day_hours"), sw = $("setting_default_hours");
   if (document.activeElement !== sd) sd.value = String(minutes_per_day() / 60);
   if (document.activeElement !== sw) sw.value = String((state.settings?.default_work_min ?? 480) / 60);
+}
+
+/// 行のまとまり：この日に完了 → 必ず振り分ける／線表でこの日に重なる → 取り組んだかもしれない／それ以外
+function work_group(r) {
+  const t = state.byId.get(r.task_id);
+  if (t?.status === "done" && t.completed_at?.slice(0, 10) === work.date) return "completed";
+  if (r.reason === "planned" || work.day?.suggestions?.some((s) => s.task_id === r.task_id && s.reason === "planned")) return "planned";
+  return "other";
 }
 
 function task_option_label(t) {
@@ -191,9 +215,10 @@ function work_row(r, minutes, total) {
   const path = path_titles(t);
   return el("div", { class: "work_row" + (r.weight > 0 ? "" : " zero") + (is_selected(t.id) ? " selected" : ""), "data-task_id": t.id },
     el("div", { class: "work_name", onclick: () => select(t.id), title: "クリックで右に詳細" },
-      el("span", { class: "title" + (t.status === "done" ? " done" : "") }, t.title),
+      el("span", { class: "title" }, t.title),
       el("span", { class: "crumb" }, path.join(" › ")),
-      el("span", { class: "reason" }, REASON_LABEL[r.reason] || "")),
+      // 「この日に完了」「予定期間」はまとまりの見出しでわかるので、行には出さない
+      el("span", { class: "reason" }, ["completed", "planned"].includes(r.reason) ? "" : REASON_LABEL[r.reason] || "")),
     slider,
     num,
     el("span", { class: "work_pct" }, total > 0 ? `${pct}%` : ""),
@@ -219,7 +244,10 @@ function preview_work() {
   const weights = work.rows.map((r) => r.weight);
   const minutes = allocate_preview(work.worked, weights);
   const total = weights.reduce((a, b) => a + b, 0);
-  document.querySelectorAll("#work_rows .work_row").forEach((rowEl, i) => {
+  // 行はまとまりごとに並べ替えて出しているので、並び順ではなくタスクの id で対応させる
+  const index = new Map(work.rows.map((r, i) => [r.task_id, i]));
+  document.querySelectorAll("#work_rows .work_row").forEach((rowEl) => {
+    const i = index.get(Number(rowEl.dataset.task_id));
     const r = work.rows[i];
     if (!r) return;
     rowEl.classList.toggle("zero", !(r.weight > 0));

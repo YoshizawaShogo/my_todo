@@ -34,6 +34,7 @@ fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         actual_min: 0,
         jira_key: None,
         links: Vec::new(),
+        depends_on: Vec::new(),
     })
 }
 
@@ -243,6 +244,12 @@ pub fn get_task(conn: &Connection, id: i64) -> ServiceResult<Task> {
         )
         .optional()?;
     task.links = links_of(conn, id)?;
+    task.depends_on = {
+        let mut stmt =
+            conn.prepare("SELECT pre_id FROM task_dependency WHERE post_id = ?1 ORDER BY pre_id")?;
+        stmt.query_map([id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
     Ok(task)
 }
 
@@ -365,7 +372,15 @@ pub fn list_tasks(conn: &Connection) -> ServiceResult<Vec<Task>> {
         let (id, link) = row?;
         task_links.entry(id).or_default().push(link);
     }
+    let mut deps: std::collections::HashMap<i64, Vec<i64>> = Default::default();
+    let mut dep_stmt =
+        conn.prepare("SELECT post_id, pre_id FROM task_dependency ORDER BY post_id, pre_id")?;
+    for row in dep_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        let (post, pre) = row?;
+        deps.entry(post).or_default().push(pre);
+    }
     for t in &mut tasks {
+        t.depends_on = deps.remove(&t.id).unwrap_or_default();
         t.links = task_links.remove(&t.id).unwrap_or_default();
         t.tags = tags.remove(&t.id).unwrap_or_default();
         t.jira_key = links.remove(&t.id);
@@ -456,6 +471,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
         None => current.next_action_date.clone(),
     };
     let status = patch.status.unwrap_or(current.status);
+    let kind = patch.kind.unwrap_or(current.kind);
     // 完了日時：状態が変わらなければそのまま、完了にしたら今、完了以外にしたら消す
     let completed_at = if status == current.status {
         current.completed_at.clone()
@@ -486,6 +502,21 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
         None => current.estimate_min,
     };
 
+    // 完了したタスクは、記録として残る名前・日程・見積もり・担当を変えない（未完了に戻せば変えられる）
+    if current.status == TaskStatus::Done
+        && status == TaskStatus::Done
+        && (title != current.title
+            || planned_start != current.planned_start
+            || planned_end != current.planned_end
+            || estimate_min != current.estimate_min
+            || kind != current.kind
+            || next_action != current.next_action
+            || next_action_date != current.next_action_date)
+    {
+        return Err(ServiceError::Invalid(
+            "完了したタスクの名前・日程・見積もり・担当・次の予定は変えられません。変えるときは未完了に戻してください".into(),
+        ));
+    }
     let tx = Tx::begin(conn)?;
     if let Some(tags) = &tags
         && *tags != current.tags
@@ -504,7 +535,7 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
     tx.execute(
         "UPDATE task SET title = ?1, note = ?2, status = ?3, completed_at = ?4, started_at = ?5, \
          planned_end = ?6, next_action = ?7, next_action_date = ?8, updated_at = ?9, \
-         planned_start = ?11, estimate_min = ?12 WHERE id = ?10",
+         planned_start = ?11, estimate_min = ?12, kind = ?13 WHERE id = ?10",
         params![
             title,
             note,
@@ -517,9 +548,20 @@ pub fn update_task(conn: &Connection, id: i64, patch: TaskPatch) -> ServiceResul
             now,
             id,
             planned_start,
-            estimate_min
+            estimate_min,
+            kind
         ],
     )?;
+    if kind != current.kind {
+        record_event(
+            &tx,
+            id,
+            &now,
+            EventKind::Kind,
+            Some(current.kind.as_str()),
+            Some(kind.as_str()),
+        )?;
+    }
 
     // いつ何を決めたか・変えたかを自動で残す（メモの変更は記録しない）
     if title != current.title {
@@ -833,6 +875,56 @@ pub fn move_tasks(
     Ok(moved)
 }
 
+/// 依存関係を足す：pre（先に終わらせるタスク）が終わってから post を始める。
+/// 自分自身や、輪になる（post から先をたどると pre に戻る）つなぎ方はできない
+pub fn add_dependency(conn: &Connection, pre: i64, post: i64) -> ServiceResult<()> {
+    if pre == post {
+        return Err(ServiceError::Invalid("同じタスク同士はつなげません".into()));
+    }
+    let tx = Tx::begin(conn)?;
+    get_task(&tx, pre)?;
+    if get_task(&tx, post)?.status == TaskStatus::Done {
+        return Err(ServiceError::Invalid(
+            "完了したタスクの前には、つながりを足せません（未完了に戻すと足せる）".into(),
+        ));
+    }
+    // post の後ろ（post を先とするタスク）をたどって pre に着いたら輪になる
+    let mut stack = vec![post];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == pre {
+            return Err(ServiceError::Invalid(
+                "つなぐと順番が輪になってしまいます（後のタスクから先へ戻る）".into(),
+            ));
+        }
+        if seen.insert(id) {
+            let mut stmt = tx.prepare("SELECT post_id FROM task_dependency WHERE pre_id = ?1")?;
+            for next in stmt.query_map([id], |r| r.get::<_, i64>(0))? {
+                stack.push(next?);
+            }
+        }
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO task_dependency (pre_id, post_id) VALUES (?1, ?2)",
+        params![pre, post],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn remove_dependency(conn: &Connection, pre: i64, post: i64) -> ServiceResult<()> {
+    if get_task(conn, post)?.status == TaskStatus::Done {
+        return Err(ServiceError::Invalid(
+            "完了したタスクの前のつながりは外せません（未完了に戻すと外せる）".into(),
+        ));
+    }
+    conn.execute(
+        "DELETE FROM task_dependency WHERE pre_id = ?1 AND post_id = ?2",
+        params![pre, post],
+    )?;
+    Ok(())
+}
+
 /// 複数のタスクからタグを 1 つ外す（付いていないものはそのまま）。タグが変わった件数を返す
 pub fn remove_tag(conn: &Connection, ids: &[i64], name: &str) -> ServiceResult<usize> {
     let key = name.trim().trim_start_matches('#').trim().to_lowercase();
@@ -979,6 +1071,100 @@ pub fn delete_task(conn: &Connection, id: i64) -> ServiceResult<()> {
 mod tests {
     use super::*;
     use crate::db;
+    use crate::model::TaskKind;
+
+    #[test]
+    fn dependencies_and_cycles() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let b = add(&conn, "B", None);
+        let c = add(&conn, "C", None);
+        add_dependency(&conn, a.id, b.id).unwrap();
+        add_dependency(&conn, b.id, c.id).unwrap();
+        add_dependency(&conn, a.id, b.id).unwrap(); // 同じものはそのまま
+        assert_eq!(get_task(&conn, b.id).unwrap().depends_on, [a.id]);
+        assert!(add_dependency(&conn, c.id, a.id).is_err()); // 輪になる
+        assert!(add_dependency(&conn, a.id, a.id).is_err());
+        let all = list_tasks(&conn).unwrap();
+        assert_eq!(
+            all.iter().find(|t| t.id == c.id).unwrap().depends_on,
+            [b.id]
+        );
+        remove_dependency(&conn, a.id, b.id).unwrap();
+        assert!(get_task(&conn, b.id).unwrap().depends_on.is_empty());
+        // タスクを消すとつながりも消える
+        delete_task(&conn, b.id).unwrap();
+        assert!(get_task(&conn, c.id).unwrap().depends_on.is_empty());
+    }
+
+    /// 多対一・一対多：つながりは「先 → 後」の辺の集まり（グラフ）なので、何本でも持てる
+    #[test]
+    fn dependencies_are_many_to_many() {
+        let conn = db::open_in_memory().unwrap();
+        let [a, b, c, d] = ["A", "B", "C", "D"].map(|t| add(&conn, t, None).id);
+        // 多対一：A・B が終わってから C
+        add_dependency(&conn, a, c).unwrap();
+        add_dependency(&conn, b, c).unwrap();
+        // 一対多：C が終わってから D と、B が終わってから D
+        add_dependency(&conn, c, d).unwrap();
+        add_dependency(&conn, b, d).unwrap();
+        assert_eq!(get_task(&conn, c).unwrap().depends_on, [a, b]);
+        assert_eq!(get_task(&conn, d).unwrap().depends_on, [b, c]);
+    }
+
+    /// 完了したタスクは名前・日程・見積もり・担当を変えられない（メモ・タグ・未完了に戻すのはできる）
+    #[test]
+    fn done_tasks_are_locked() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let p = |json: &str| serde_json::from_str::<TaskPatch>(json).unwrap();
+        update_task(
+            &conn,
+            a.id,
+            p(r#"{"planned_end":"2026-12-01","estimate_min":60,"status":"done"}"#),
+        )
+        .unwrap();
+        assert!(update_task(&conn, a.id, p(r#"{"planned_end":"2026-12-02"}"#)).is_err());
+        assert!(update_task(&conn, a.id, p(r#"{"title":"B"}"#)).is_err());
+        assert!(update_task(&conn, a.id, p(r#"{"estimate_min":120}"#)).is_err());
+        assert!(update_task(&conn, a.id, p(r#"{"kind":"external"}"#)).is_err());
+        assert!(update_task(&conn, a.id, p(r#"{"next_action":"確認"}"#)).is_err());
+        // 完了したタスクの前にはつなげない（後ろにはつなげる）
+        let b = add(&conn, "B", None);
+        assert!(add_dependency(&conn, b.id, a.id).is_err());
+        add_dependency(&conn, a.id, b.id).unwrap();
+        update_task(&conn, a.id, p(r#"{"note":"メモ","tags":["x"]}"#)).unwrap();
+        // 未完了に戻すと同時に変えるのはよい
+        let t = update_task(
+            &conn,
+            a.id,
+            p(r#"{"status":"todo","planned_end":"2026-12-03"}"#),
+        )
+        .unwrap();
+        assert_eq!(t.planned_end.as_deref(), Some("2026-12-03"));
+    }
+
+    #[test]
+    fn kind_can_be_changed_and_is_recorded() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add(&conn, "A", None);
+        let t = update_task(
+            &conn,
+            a.id,
+            TaskPatch {
+                kind: Some(TaskKind::External),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(t.kind, TaskKind::External);
+        assert!(
+            list_events(&conn, a.id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == EventKind::Kind)
+        );
+    }
 
     #[test]
     fn remove_tag_from_many() {

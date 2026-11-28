@@ -23,7 +23,7 @@ str_enum! {
 }
 
 str_enum! {
-    /// タスクの種類（自分のタスクか、外部ジョブか。外部ジョブはいまはタグで代用していて未使用）
+    /// タスクの担当：自分か、他の人か（他の人の作業は工数記録の候補に出さず、線表で見た目を変える）
     pub enum TaskKind {
         Own => "self",
         External => "external",
@@ -42,6 +42,7 @@ str_enum! {
         Tags => "tags",
         Estimate => "estimate",
         Jira => "jira",
+        Kind => "kind",
     }
 }
 
@@ -82,6 +83,8 @@ pub struct Task {
     pub actual_min: i64,
     /// 紐付けた Jira の課題キー（例：ABC-123）
     pub jira_key: Option<String>,
+    /// 先に終わらせるタスク（依存関係）の id
+    pub depends_on: Vec<i64>,
     /// 関連資料（URL）
     pub links: Vec<TaskLink>,
 }
@@ -127,6 +130,9 @@ pub struct TaskPatch {
     /// Jira の課題キー（空文字か null で紐付けを外す）
     #[serde(default, deserialize_with = "double_option")]
     pub jira_key: Option<Option<String>>,
+    /// 担当（自分・他の人）
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
 }
 
 /// タグと、それが付いているタスクの数

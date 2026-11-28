@@ -13,7 +13,7 @@ use crate::model::{MoveTarget, NewTask, Placement, TagCount, Task, TaskEvent, Ta
 use crate::service::agenda_service::{self, Agenda};
 use crate::service::template_service::{self, Template, TemplateSummary};
 use crate::service::work_service::{self, DaySummary, SaveDay, Settings, SettingsPatch, WorkDay};
-use crate::service::{ServiceError, link_service, task_service, undo_service};
+use crate::service::{ServiceError, link_service, review_service, task_service, undo_service};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -32,6 +32,12 @@ pub fn router() -> Router<AppState> {
         .route("/tasks/create_many", post(create_tasks))
         .route("/tasks/{id}/events", get(list_events))
         .route("/tasks/{id}/links", post(add_link))
+        .route(
+            "/dependencies",
+            post(add_dependency).delete(remove_dependency),
+        )
+        .route("/reviews", get(list_reviews))
+        .route("/tasks/{id}/review", axum::routing::put(save_review))
         .route(
             "/links/{id}",
             axum::routing::patch(rename_link).delete(delete_link),
@@ -131,6 +137,8 @@ fn describe_patch(p: &TaskPatch) -> &'static str {
         "見積もりの変更"
     } else if p.note.is_some() {
         "メモの変更"
+    } else if p.kind.is_some() {
+        "担当の変更"
     } else {
         "変更"
     }
@@ -737,6 +745,75 @@ async fn delete_tasks(
     let label = format!("{} 件の削除", req.ids.len());
     with_conn(&s, |c| {
         undo_service::record(c, &label, |c| task_service::delete_tasks(c, &req.ids))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- 振り返り ----------
+
+async fn list_reviews(
+    State(s): State<AppState>,
+    Query(q): Query<RangeQuery>,
+) -> ApiResult<Vec<review_service::ReviewItem>> {
+    with_conn(&s, |c| review_service::list(c, &q.from, &q.to)).map(Json)
+}
+
+async fn save_review(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<review_service::ReviewInput>,
+) -> Result<StatusCode, ApiError> {
+    with_conn(&s, |c| {
+        let label = format!("「{}」の振り返り", task_service::get_task(c, id)?.title);
+        undo_service::record(c, &label, |c| review_service::save(c, id, input))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- 依存関係 ----------
+
+#[derive(serde::Deserialize)]
+struct Dependency {
+    /// 先に終わらせるタスク
+    pre_id: i64,
+    /// 後のタスク
+    post_id: i64,
+}
+
+fn dependency_label(
+    c: &rusqlite::Connection,
+    d: &Dependency,
+    verb: &str,
+) -> Result<String, ServiceError> {
+    Ok(format!(
+        "「{}」→「{}」のつながりを{verb}",
+        task_service::get_task(c, d.pre_id)?.title,
+        task_service::get_task(c, d.post_id)?.title
+    ))
+}
+
+async fn add_dependency(
+    State(s): State<AppState>,
+    Json(d): Json<Dependency>,
+) -> Result<StatusCode, ApiError> {
+    with_conn(&s, |c| {
+        let label = dependency_label(c, &d, "追加")?;
+        undo_service::record(c, &label, |c| {
+            task_service::add_dependency(c, d.pre_id, d.post_id)
+        })
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_dependency(
+    State(s): State<AppState>,
+    Json(d): Json<Dependency>,
+) -> Result<StatusCode, ApiError> {
+    with_conn(&s, |c| {
+        let label = dependency_label(c, &d, "削除")?;
+        undo_service::record(c, &label, |c| {
+            task_service::remove_dependency(c, d.pre_id, d.post_id)
+        })
     })?;
     Ok(StatusCode::NO_CONTENT)
 }

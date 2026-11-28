@@ -5,6 +5,7 @@ pub mod agenda_service;
 pub mod calendar;
 pub mod jira_service;
 pub mod link_service;
+pub mod review_service;
 pub mod task_service;
 pub mod template_service;
 pub mod undo_service;

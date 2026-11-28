@@ -594,6 +594,10 @@ function toggle_in(list, name) {
 
 /// タイトルをその場で編集する
 function start_inline_edit(titleEl, task, onDone) {
+  if (task.status === "done") {
+    toast("完了したタスクの名前は変えられません（未完了に戻すと変えられる）", "error");
+    return;
+  }
   const input = el("input", { class: "title_input", type: "text" });
   input.value = task.title;
   let finished = false;
@@ -664,6 +668,148 @@ const STATUS_LABEL = { todo: "未着手", doing: "作業中", done: "完了" };
 /// - overdue：終了予定日を過ぎたのに完了していない
 /// - late_start：開始予定日を過ぎたのに未着手（期限切れのときは期限切れを優先）
 /// - next_overdue：次の予定の日を過ぎた（未完了）
+// ---------- 見積もりと負荷 ----------
+/// 期間の平日の数（両端を含む）。土日だけの期間なら暦日の数
+function weekdays_in(start, end) {
+  let n = 0, all = 0;
+  for (let d = start; d <= end; d = add_days(d, 1)) {
+    all++;
+    const wd = weekday_of(d);
+    if (wd !== 0 && wd !== 6) n++;
+    if (all > 3660) break;
+  }
+  return n || all;
+}
+
+/// タスクの見積もり（分）：自分の見積もり、なければ子の見積もりの合計（子にもなければ null）
+function task_estimate(t) {
+  if (t.estimate_min) return t.estimate_min;
+  let sum = 0, any = false;
+  for (const c of children_of(t.id)) {
+    const e = task_estimate(c);
+    if (e) { sum += e; any = true; }
+  }
+  return any ? sum : null;
+}
+
+/// 子孫のどれかに自分の見積もりがあるか（あれば、負荷は子の方で数える）
+function has_descendant_estimate(t) {
+  return children_of(t.id).some((c) => c.estimate_min || has_descendant_estimate(c));
+}
+
+/// 1 日に使える時間（分）：工数記録の設定の「1D」
+function day_capacity() {
+  return minutes_per_day();
+}
+
+/// 負荷：見積もりを期間の平日に均した 1 日あたりの時間。期間がなければ null
+function task_load(t) {
+  const est = task_estimate(t);
+  const { start, end } = span_of(t);
+  const s = start || end, e = end || start;
+  if (!est || !s || !e || s > e) return null;
+  const days = weekdays_in(s, e);
+  return { est, days, perDay: est / days, start: s, end: e };
+}
+
+/// 見積もりが期間に収まらない（平日 × 1D を超える）か
+function too_heavy(t) {
+  const l = task_load(t);
+  return Boolean(l && t.status !== "done" && l.perDay > day_capacity());
+}
+
+/// 見積もりの入っていない、線表に日程のある自分の未完了タスクか（子に見積もりがあれば数えない）
+function needs_estimate(t) {
+  if (t.status === "done" || t.kind === "external" || (t.parent_id === null && t.is_inbox)) return false;
+  if (!t.planned_start && !t.planned_end) return false;
+  return !task_estimate(t);
+}
+
+/// 詰め込みすぎの期間：その期間の中に期間がまるごと収まるタスクの残りの見積もりの合計が、
+/// 「期間の平日 × 1D」を超えるもの。作業を均等に割らず、各タスクの期間の中ならいつやってもよいと考えたうえで、
+/// どう割り振っても無理なときだけ知らせる。今日から先だけ（始まっているタスクは今日から、残り＝見積もり − 記録した工数）。
+/// 同じ理由で外側の期間も無理になるので、中にほかの無理な期間を含まない、いちばん狭いものだけを返す。
+/// 1 件だけで無理なもの（期間に収まらない）は too_heavy で知らせるので除く
+function overloaded_periods() {
+  const today = today_text();
+  const items = [];
+  for (const t of state.tasks) {
+    if (t.status === "done" || t.kind === "external" || !t.estimate_min || has_descendant_estimate(t)) continue;
+    const l = task_load(t);
+    if (!l || l.end < today) continue;
+    const remaining = Math.max(0, t.estimate_min - (t.actual_min || 0));
+    if (!remaining) continue;
+    items.push({ t, start: l.start > today ? l.start : today, end: l.end, remaining });
+  }
+  const starts = [...new Set(items.map((x) => x.start))].sort();
+  const ends = [...new Set(items.map((x) => x.end))].sort();
+  const bad = [];
+  for (const a of starts) {
+    for (const b of ends) {
+      if (b < a) continue;
+      const inside = items.filter((x) => x.start >= a && x.end <= b);
+      if (inside.length < 2) continue;
+      const total = inside.reduce((n, x) => n + x.remaining, 0);
+      const cap = weekdays_in(a, b) * day_capacity();
+      if (total > cap + 1) bad.push({ start: a, end: b, total, cap, tasks: inside.map((x) => x.t) });
+    }
+  }
+  return bad.filter((p) => !bad.some((q) => q !== p && q.start >= p.start && q.end <= p.end && (q.start > p.start || q.end < p.end)))
+    .sort((p, q) => (p.start < q.start ? -1 : p.start > q.start ? 1 : 0));
+}
+
+/// バーの太さの段階：見積もりの大きさ（2h 以下は細い、1D 以下は普通、それより大きいと太い）。見積もりがなければ "unknown"
+function load_level(t) {
+  // 他の人の作業は見積もりを求めない（いつまでに終わるかだけを見る）ので、太さは普通・点線にもしない
+  if (t.kind === "external") return "other";
+  const est = task_estimate(t);
+  if (!est) return "unknown";
+  return est <= 120 ? "light" : est <= day_capacity() ? "medium" : "heavy";
+}
+
+// ---------- 依存関係 ----------
+/// 依存関係で使う日付：始まり（なければ終わり）と終わり（なければ始まり）。親で自分の日付がなければ子の範囲
+function dep_dates(t) {
+  let { start, end } = span_of(t);
+  if (!start && !end) {
+    const sub = subtree_span(t);
+    if (sub) ({ start, end } = sub);
+  }
+  return { start: start || end, end: end || start };
+}
+
+/// 順番が逆（先のタスクが終わる予定より前に、後のタスクを始める予定）になっているか。
+/// どちらかが完了していれば、もう待つものはないので問題にしない
+function dependency_broken(pre, post) {
+  if (pre.status === "done" || post.status === "done") return false;
+  const a = dep_dates(pre), b = dep_dates(post);
+  return Boolean(a.end && b.start && b.start < a.end);
+}
+
+/// すべての依存関係 [{pre, post}]
+function all_dependencies() {
+  const out = [];
+  for (const post of state.tasks) {
+    for (const preId of post.depends_on || []) {
+      const pre = state.byId.get(preId);
+      if (pre) out.push({ pre, post });
+    }
+  }
+  return out;
+}
+
+async function add_dependency(preId, postId) {
+  await api("POST", "/dependencies", { pre_id: preId, post_id: postId });
+  await reload();
+  toast(`「${state.byId.get(preId)?.title}」→「${state.byId.get(postId)?.title}」をつなぎました（Ctrl+Z で元に戻す）`);
+}
+
+async function remove_dependency(preId, postId) {
+  await api("DELETE", "/dependencies", { pre_id: preId, post_id: postId });
+  await reload();
+  toast("つながりを外しました（Ctrl+Z で元に戻す）");
+}
+
 function task_alerts(t, today = today_text()) {
   if (t.status === "done") return { overdue: false, late_start: false, next_overdue: false };
   const overdue = Boolean(t.planned_end && t.planned_end < today);
@@ -682,12 +828,14 @@ function render() {
     b.setAttribute("aria-selected", active);
   }
   for (const name of TABS) $("view_" + name).hidden = state.tab !== name;
+  $("review_pane").hidden = state.tab !== "review";
   // タブの描画で例外が起きても、詳細パネル（選択の解除・消したタスクを閉じる）は必ず描き直す
   try {
     render_alerts();
     if (state.tab === "gantt") render_gantt();
     else if (state.tab === "list") render_list();
     else if (state.tab === "work") render_work();
+    else if (state.tab === "review") render_review();
     else if (state.tab === "jira") render_jira();
     else render_help();
     mark_cut_rows();
@@ -698,7 +846,7 @@ function render() {
   render_detail();
 }
 
-const TABS = ["gantt", "list", "work", "jira", "help"];
+const TABS = ["gantt", "list", "work", "review", "jira", "help"];
 
 function switch_tab(tab) {
   if (state.tab === tab) return;
@@ -929,7 +1077,28 @@ function apply_selection_classes() {
 let renderedDetailId = null;
 let historyKey = null; // 履歴を取り直すかの判定用（id と再読み込みの回数）
 
-let detailMoreTab = null; // 「その他」の開閉を最後に決めたときのタブ
+/// 依存関係の欄：先に終わらせるタスク（× で外す）と、このタスクの後に続くタスク
+function render_detail_deps(task) {
+  const item = (other, onRemove, broken, locked = false) => el("li", { class: broken ? "broken" : "" },
+    el("a", { href: "#", class: "link_title", title: "クリックでそのタスクを選ぶ", onclick: (ev) => { ev.preventDefault(); select(other.id); } },
+      other.title + (broken ? "（順番が逆）" : "")),
+    el("button", {
+      type: "button",
+      class: "icon_button danger",
+      disabled: locked,
+      title: locked ? "完了したタスクなので外せません（状態を未完了に戻すと外せる）" : "このつながりを外す",
+      onclick: onRemove,
+    }, "×"));
+  const pres = (task.depends_on || []).map((id) => state.byId.get(id)).filter(Boolean);
+  $("detail_deps_pre").replaceChildren(...pres.map((p) => item(p, () => remove_dependency(p.id, task.id), dependency_broken(p, task), task.status === "done")));
+  const posts = state.tasks.filter((t) => (t.depends_on || []).includes(task.id));
+  $("detail_deps_post").replaceChildren(...(posts.length
+    ? [el("span", { class: "field_label" }, "このタスクの後に続くタスク"),
+      el("ul", { class: "link_list" }, ...posts.map((p) => item(p, () => remove_dependency(task.id, p.id), dependency_broken(task, p))))]
+    : []));
+  const taken = new Set([task.id, ...pres.map((p) => p.id)]);
+  $("dep_options").replaceChildren(...state.tasks.filter((t) => !taken.has(t.id)).map((t) => el("option", { value: task_option_label(t) })));
+}
 
 /// 関連資料の一覧。名前をクリックで開く（新しいタブ）、ダブルクリックで名前を変える、× で外す
 function render_detail_links(task) {
@@ -980,6 +1149,9 @@ function render_detail_links(task) {
   }));
 }
 
+let detailMoreTab = null; // 「その他」の開閉を最後に決めたときのタブ
+
+
 function render_detail() {
   const panel = $("detail");
   const task = state.selectedId === null ? null : state.byId.get(state.selectedId);
@@ -998,6 +1170,22 @@ function render_detail() {
   const fill = (id, value) => {
     if (renderedDetailId !== task.id || active !== $(id)) $(id).value = value ?? "";
   };
+  // 完了したタスクは、名前・日程・見積もり・担当を変えられない（サーバーでも止めている）
+  const locked = task.status === "done";
+  // 操作できない欄には、カーソルを合わせると理由が出るようにする（無効の欄は自分では反応しないので、囲みにも付ける）
+  const why = locked ? "完了したタスクなので変えられません（状態を未完了に戻すと変えられる）" : "";
+  for (const id of ["detail_title", "detail_planned_start", "detail_planned_end", "detail_estimate", "detail_kind",
+    "detail_next_action_date", "detail_next_action", "detail_dep_input"]) {
+    const input = $(id);
+    input.disabled = locked;
+    if (locked) input.dataset.lockedTitle = "1", input.title = why;
+    else if (input.dataset.lockedTitle) { delete input.dataset.lockedTitle; input.removeAttribute("title"); }
+    const box = input.closest(".field, .next_action, .links_box");
+    if (box) box.title = why;
+  }
+  // 他の人の作業は見積もりを求めないので、見積もりの欄を出さない
+  document.querySelector("#detail .effort_box").hidden = task.kind === "external";
+  $("detail_locked").hidden = !locked;
   fill("detail_title", task.title);
   fill("detail_note", task.note);
   fill("detail_planned_start", task.planned_start);
@@ -1017,25 +1205,23 @@ function render_detail() {
   }
   fill("detail_estimate", task.estimate_min === null ? "" : fmt_hours(task.estimate_min));
   const actual = subtree_actual(task);
-  const parts = [];
-  if (actual) parts.push(`記録 ${fmt_effort(actual)}${actual !== task.actual_min ? "（子を含む）" : ""}`);
-  if (task.estimate_min) {
-    parts.push(`見積もり ${fmt_effort(task.estimate_min)}`);
-    if (actual) parts.push(`消化 ${Math.round((actual / task.estimate_min) * 100)}%`);
-  }
-  $("detail_actual").textContent = parts.join(" ／ ") || "まだ工数の記録はありません（工数記録タブで振り分け）";
-  $("detail_actual").classList.toggle("over", Boolean(task.estimate_min && actual > task.estimate_min));
-  // 「その他」：タブを切り替えたときだけ開閉を決める（詳細タブでは開く、ほかでは畳む）。中身は畳んでいても見出しに要約を出す
+  // 「その他」：タブを切り替えたときだけ開閉を決める（詳細タブでは開く、ほかでは畳む）。中身は畳んでいても見出しに要約を出す。
+  // 開始・終了予定日は、線表ではバーで決めるので「その他」に、詳細タブでは上に置く
   if (detailMoreTab !== state.tab) {
     detailMoreTab = state.tab;
     $("detail_more").open = state.tab === "list";
+    (state.tab === "gantt" ? $("detail_dates_more") : $("detail_dates_main")).append($("detail_dates"));
   }
   const more = [];
+  if (state.tab === "gantt" && (task.planned_start || task.planned_end)) {
+    more.push(`${task.planned_start ? short_date(task.planned_start) : ""}〜${task.planned_end ? short_date(task.planned_end) : ""}`);
+  }
   if (task.jira_key) more.push(task.jira_key);
-  if (task.estimate_min) more.push(`見積もり ${fmt_hours(task.estimate_min)}`);
-  if (actual) more.push(`記録 ${fmt_hours(actual)}`);
-  $("detail_more_summary").textContent = more.length ? `：${more.join("・")}` : "（Jira 課題・見積もり）";
+  $("detail_more_summary").textContent = more.length ? `：${more.join("・")}` : state.tab === "gantt" ? "（日程・Jira 課題）" : "（Jira 課題）";
+
   render_detail_links(task);
+  render_detail_deps(task);
+  $("detail_kind").value = task.kind || "self";
   $("detail_tags").replaceChildren(...task.tags.map((name) => el("span", {
     class: "tag_chip",
     style: tag_style(name),
@@ -1055,7 +1241,14 @@ function render_detail() {
 
   // 場所だけを出す（作った日・着手・完了は「変更の履歴」に出るので、ここでは重ねない）
   const path = path_titles(task);
-  $("detail_meta").textContent = `場所：${path.length ? path.join(" › ") : task.is_inbox ? "未分類" : "線表の最上位"}`;
+  // 場所と、記録した工数（結果）。記録がなければ工数の行は出さない
+  const meta = [`場所：${path.length ? path.join(" › ") : task.is_inbox ? "未分類" : "線表の最上位"}`];
+  if (actual) {
+    const est = task_estimate(task);
+    meta.push(`記録した工数：${fmt_effort(actual)}${actual !== task.actual_min ? "（子を含む）" : ""}` +
+      (est ? `・見積もりの ${Math.round((actual / est) * 100)}%` : ""));
+  }
+  $("detail_meta").textContent = meta.join("\n");
   renderedDetailId = task.id;
 
   const key = `${task.id}@${reloadCount}`;
@@ -1095,6 +1288,7 @@ function describe_event(e) {
     case "tags": return change("タグ");
     case "estimate": return change("見積もり", (v) => fmt_hours(Number(v)));
     case "jira": return change("Jira 課題");
+    case "kind": return `担当を変更: ${o === "external" ? "他の人" : "自分"} → ${n === "external" ? "他の人" : "自分"}`;
     default: return `${e.kind}: ${o ?? ""} → ${n ?? ""}`;
   }
 }
@@ -1235,6 +1429,15 @@ function setup_detail() {
     });
   });
   $("detail_delete").addEventListener("click", () => remove(state.selectedId));
+  $("detail_kind").addEventListener("change", (ev) => { if (state.selectedId !== null) update(state.selectedId, { kind: ev.target.value }); });
+  $("detail_dep_input").addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.isComposing) return;
+    const label = ev.target.value.trim();
+    const pre = state.tasks.find((t) => task_option_label(t) === label) || state.tasks.find((t) => t.title === label);
+    if (!pre) { toast("そのタスクは見つかりません", "error"); return; }
+    ev.target.value = "";
+    add_dependency(pre.id, state.selectedId);
+  });
 }
 
 /// 文字を入力する欄か（チェックボックスや選択肢にフォーカスがあるときは、アプリのショートカットを効かせる）
@@ -1294,17 +1497,6 @@ function setup() {
     }
   });
 
-  // 何もない所（タスクの行・詳細パネル・ボタンや入力欄・小窓の外）をクリックしたら、選択を解除する
-  const KEEP_SELECTION = "[data-task_id], #detail, button, input, select, textarea, label, a, summary, details, " +
-    ".tag_chip, .chip, .link_mark, .db_panel, .template_panel, .tag_picker, .datepicker, .alert_panel, .toast, .top_bar";
-  document.addEventListener("click", (ev) => {
-    if (state.selectedId === null && state.selected.size === 0) return;
-    if (!(ev.target instanceof Element) || !ev.target.isConnected) return; // 描き直しで消えた要素のクリックは無視
-    if (ev.target.closest(KEEP_SELECTION)) return;
-    if (window.getSelection()?.toString()) return; // 文字を選んでいるときはそのまま
-    select(null);
-  });
-
   // 開いたまま日付が変わっても表示が古くならないように、画面に戻ったら読み直す
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") reload();
@@ -1318,6 +1510,7 @@ function setup() {
   setup_alerts();
   setup_clipboard();
   setup_templates();
+  setup_review();
   setup_tag_drop();
   // 落とし先（行・見出し）の外に出たら、前後の線や枠の印を消す
   document.addEventListener("dragover", (ev) => {

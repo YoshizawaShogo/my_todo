@@ -1,7 +1,8 @@
 "use strict";
 // 異常を知らせる。ヘッダーのタブの右に出す。
 // - アプリ（my_todo.exe）と通信できない：赤い帯。5 秒ごとに確かめ、つながり直したら消して読み直す
-// - 要確認の一覧：期限切れ・開始遅れ・次の予定を過ぎた・工数の記録漏れ（今週の過ぎた平日）
+// - 要確認の一覧：期限切れ・開始遅れ・次の予定を過ぎた・順番が逆（依存関係）・工数の記録漏れ（今週の過ぎた平日）
+//   他の人の作業の遅れは一覧に出さない（自分の作業に影響するときは「順番が逆」で出る）
 
 const alerts = {
   offline: false,
@@ -46,11 +47,16 @@ async function check_connection() {
 // ---------- 要確認の一覧 ----------
 function collect_alerts() {
   const today = today_text();
-  const groups = { overdue: [], late_start: [], next_overdue: [] };
+  const groups = { overdue: [], late_start: [], next_overdue: [], broken: [], no_estimate: [], too_heavy: [], overload: [] };
   for (const t of state.tasks) {
+    if (t.kind === "external") continue;
     const a = task_alerts(t, today);
-    for (const k of Object.keys(groups)) if (a[k]) groups[k].push(t);
+    for (const k of ["overdue", "late_start", "next_overdue"]) if (a[k]) groups[k].push(t);
+    if (needs_estimate(t)) groups.no_estimate.push(t);
+    if (too_heavy(t)) groups.too_heavy.push(t);
   }
+  groups.overload = overloaded_periods();
+  groups.broken = all_dependencies().filter(({ pre, post }) => dependency_broken(pre, post));
   return groups;
 }
 
@@ -79,7 +85,8 @@ async function refresh_unrecorded() {
 
 function render_alerts() {
   const g = collect_alerts();
-  const total = g.overdue.length + g.late_start.length + g.next_overdue.length + alerts.unrecorded.length;
+  const total = g.overdue.length + g.late_start.length + g.next_overdue.length + g.broken.length +
+    g.no_estimate.length + g.too_heavy.length + g.overload.length + alerts.unrecorded.length;
   const btn = $("alert_button");
   btn.hidden = total === 0;
   btn.textContent = `⚠ 要確認 ${total}`;
@@ -87,6 +94,10 @@ function render_alerts() {
     g.overdue.length && `期限切れ ${g.overdue.length}`,
     g.late_start.length && `開始遅れ ${g.late_start.length}`,
     g.next_overdue.length && `次の予定を過ぎた ${g.next_overdue.length}`,
+    g.broken.length && `順番が逆 ${g.broken.length}`,
+    g.too_heavy.length && `期間に収まらない ${g.too_heavy.length}`,
+    g.overload.length && `詰め込みすぎの期間 ${g.overload.length}`,
+    g.no_estimate.length && `見積もりなし ${g.no_estimate.length}`,
     alerts.unrecorded.length && `工数の記録漏れ ${alerts.unrecorded.length} 日`,
   ].filter(Boolean).join("\n");
   if (total === 0) toggle_alert_panel(false);
@@ -117,6 +128,25 @@ function draw_alert_panel(g) {
     section("期限切れ", "終了予定日を過ぎた未完了", g.overdue.map((t) => task_item(t, `〜${short_date(t.planned_end)}`))),
     section("開始遅れ", "開始予定日を過ぎても未着手", g.late_start.map((t) => task_item(t, `${short_date(t.planned_start)} 開始予定`))),
     section("次の予定を過ぎた", "", g.next_overdue.map((t) => task_item(t, `▶ ${short_date(t.next_action_date)} ${t.next_action || ""}`))),
+    section("順番が逆", "先のタスクが終わる前に、後のタスクを始める予定になっている", g.broken.map(({ pre, post }) =>
+      task_item(post, `「${pre.title}」が ${short_date(dep_dates(pre).end)} まで`))),
+    section("期間に収まらない", "見積もりが「期間の平日 × 1 日の時間」を超えている", g.too_heavy.map((t) => {
+      const l = task_load(t);
+      return task_item(t, `${fmt_hours(l.est)} を平日 ${l.days} 日で`);
+    })),
+    section("詰め込みすぎの期間", "その期間に収めるタスクの残りの見積もりが、平日 × 1 日の時間に入らない", g.overload.map((p) => el("li", {},
+      el("button", {
+        type: "button",
+        title: p.tasks.map((t) => t.title).join("\n"),
+        onclick: () => {
+          toggle_alert_panel(false);
+          switch_tab("gantt");
+          gantt.start = monday_of(add_days(p.start, -7));
+          render_gantt();
+        },
+      }, el("span", { class: "name" }, `${short_date(p.start)}〜${short_date(p.end)}`),
+        el("span", { class: "note" }, `${fmt_hours(Math.round(p.total))} ／ 入るのは ${fmt_hours(p.cap)}（${p.tasks.length} 件）`))))),
+    section("見積もりなし", "線表に日程を入れた自分のタスク（見積もる癖をつけるため）", g.no_estimate.map((t) => task_item(t, t.planned_end ? `〜${short_date(t.planned_end)}` : `${short_date(t.planned_start)}〜`))),
     section("工数の記録漏れ", "今週の過ぎた平日で勤務時間が未記録", alerts.unrecorded.map((d) => el("li", {},
       el("button", {
         type: "button",

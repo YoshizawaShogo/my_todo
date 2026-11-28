@@ -336,6 +336,11 @@ const STATIC_FILES: &[(&str, &str, &str)] = &[
     ("jira.js", "text/javascript", include_str!("static/jira.js")),
     ("list.js", "text/javascript", include_str!("static/list.js")),
     ("work.js", "text/javascript", include_str!("static/work.js")),
+    (
+        "review.js",
+        "text/javascript",
+        include_str!("static/review.js"),
+    ),
     ("style.css", "text/css", include_str!("static/style.css")),
     (
         "favicon.svg",
