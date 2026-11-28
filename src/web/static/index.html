@@ -66,6 +66,7 @@
               <span class="legend_bar todo"></span>未着手
               <span class="legend_bar doing"></span>作業中
               <span class="legend_bar done"></span>完了
+              <span class="legend_bar other"></span>他の人
               <span class="legend_bar summary"></span>子の範囲
               <span class="legend_mark">◆</span>終了日のみ
               <span class="legend_mark next">▶</span>次の予定
@@ -224,6 +225,8 @@
           <div class="jira_form">
             <div class="jira_field"><span>Jira の URL</span><input id="jira_url" type="text" placeholder="https://jira.example.com" autocomplete="off"></div>
             <div class="jira_field"><span>PAT（個人用アクセストークン）</span><input id="jira_token" type="password" placeholder="新しく入れるときだけ" autocomplete="off"></div>
+            <div class="jira_field"><span>開始日に使う項目（会社ごとの独自の項目。空なら開始日は同期しない）</span><input id="jira_start_field" type="text" placeholder="例：customfield_10015" autocomplete="off"></div>
+            <p class="empty_hint flat">このアプリは、Jira の権限に関わらず、担当者が自分の課題だけを読み書きします。</p>
             <div class="jira_buttons">
               <button type="button" class="small_button primary" id="jira_save">保存</button>
               <button type="button" class="small_button" id="jira_test">接続テスト</button>
@@ -255,6 +258,16 @@
 
         <section class="list_section jira_section">
           <div class="jira_toolbar">
+            <h2 class="section_title flat">日程・見積もりの同期</h2>
+            <span class="spacer"></span>
+            <button type="button" class="small_button primary" id="jira_fields_compare">Jira と比べる</button>
+          </div>
+          <p class="empty_hint">課題キーを付けたタスクの、期日（終了予定日）・開始日・見積もりを Jira と比べます。違いを確かめてから、アプリの値を送るか、Jira の値を取り込むかを選びます。</p>
+          <div id="jira_fields"></div>
+        </section>
+
+        <section class="list_section jira_section">
+          <div class="jira_toolbar">
             <h2 class="section_title flat">エクスポート（工数を Jira に送る）</h2>
             <span class="spacer"></span>
             <button type="button" class="small_button primary" id="jira_send">Jira に送信</button>
@@ -269,6 +282,13 @@
       </div>
     </div>
 
+    <aside id="dep_pane" class="detail dep_pane" hidden>
+      <div class="detail_header">
+        <h2>つながり</h2>
+        <button id="dep_close" class="icon_button" type="button" title="閉じる">✕</button>
+      </div>
+      <div id="dep_pane_body"></div>
+    </aside>
     <aside id="review_pane" class="detail review_pane" hidden>
       <div class="detail_header"><h2 id="review_pane_title">振り返り</h2></div>
       <div id="review_pane_body"></div>

@@ -54,6 +54,9 @@ pub fn router() -> Router<AppState> {
         .route("/jira/search", get(search_jira))
         .route("/jira/import", post(import_jira))
         .route("/jira/send", post(send_jira))
+        .route("/jira/fields", get(compare_jira_fields))
+        .route("/jira/fields/push", post(push_jira_fields))
+        .route("/jira/fields/pull", post(pull_jira_fields))
         .route("/about", get(about))
         .route("/databases", get(list_databases))
         .route("/databases/open", post(open_database))
@@ -281,32 +284,40 @@ fn jira_error(msg: String) -> Response {
     (StatusCode::BAD_GATEWAY, Json(json!({ "error": msg }))).into_response()
 }
 
-fn jira_client(s: &AppState) -> Result<DataCenterClient, String> {
+/// Jira の通信相手。必ず「担当者が自分の課題だけ」の制限（MineOnly）を通す
+fn jira_client(s: &AppState) -> Result<jira::MineOnly<DataCenterClient>, String> {
     let base = with_conn(s, jira_service::get_config)
         .map_err(|e| e.0.to_string())?
         .base_url
         .ok_or("Jira の URL が設定されていません（Jira タブで設定）")?;
     let (token, _) = jira::load_token(Some(&base))
         .ok_or("この URL 用の PAT が設定されていません（Jira タブで設定）")?;
-    DataCenterClient::new(&base, &token)
+    DataCenterClient::new(&base, &token).map(jira::MineOnly::new)
 }
 
 async fn get_jira(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let config = with_conn(&s, jira_service::get_config)?;
     let source = jira::load_token(config.base_url.as_deref()).map(|(_, src)| src);
     Ok(Json(
-        json!({ "base_url": config.base_url, "token_source": source }),
+        json!({ "base_url": config.base_url, "token_source": source, "start_field": config.start_field }),
     ))
 }
 
 #[derive(serde::Deserialize)]
 struct JiraConfigPatch {
     base_url: Option<String>,
+    /// 開始日に使う項目（customfield_数字。空文字で同期しない）
+    start_field: Option<String>,
     /// 空文字で削除。値は返さない
     token: Option<String>,
 }
 
 async fn update_jira(State(s): State<AppState>, Json(p): Json<JiraConfigPatch>) -> Response {
+    if let Some(f) = &p.start_field
+        && let Err(e) = with_conn(&s, |c| jira_service::set_start_field(c, f))
+    {
+        return e.into_response();
+    }
     if let Some(url) = &p.base_url
         && let Err(e) = with_conn(&s, |c| jira_service::set_base_url(c, url))
     {
@@ -359,6 +370,52 @@ async fn get_jira_draft(
     Query(q): Query<RangeQuery>,
 ) -> ApiResult<jira_service::Draft> {
     with_conn(&s, |c| jira_service::build_draft(c, &q.from, &q.to)).map(Json)
+}
+
+/// 期日・開始日・見積もりを、アプリと Jira で比べる（担当者が自分の課題だけ）
+async fn compare_jira_fields(State(s): State<AppState>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    match jira::compare_fields(&client, &s.conn).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => jira_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FieldsRequest {
+    /// 画面で確認した違い（比べ直して食い違ったら何もしない）
+    expected: Vec<jira::FieldDiff>,
+}
+
+fn fields_result(r: Result<Vec<jira::FieldProblem>, String>) -> Response {
+    match r {
+        Ok(problems) => Json(json!({ "problems": problems })).into_response(),
+        Err(e) if e == jira::CHANGED_SINCE_CONFIRM => {
+            (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response()
+        }
+        Err(e) => jira_error(e),
+    }
+}
+
+/// アプリの値を Jira に送る（アプリがマスター）
+async fn push_jira_fields(State(s): State<AppState>, Json(q): Json<FieldsRequest>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    fields_result(jira::push_fields(&client, &s.conn, &q.expected).await)
+}
+
+/// Jira の値をアプリに取り込む（Jira がマスター。Ctrl+Z で戻せる）
+async fn pull_jira_fields(State(s): State<AppState>, Json(q): Json<FieldsRequest>) -> Response {
+    let client = match jira_client(&s) {
+        Ok(c) => c,
+        Err(e) => return jira_error(e),
+    };
+    fields_result(jira::pull_fields(&client, &s.conn, &q.expected).await)
 }
 
 #[derive(serde::Deserialize)]

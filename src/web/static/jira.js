@@ -73,6 +73,73 @@ function draw_jira_connection() {
   $("jira_token_delete").hidden = c.token_source !== "keyring";
   const jql = $("jira_jql");
   if (document.activeElement !== jql) jql.value = jira.jql;
+  const sf = $("jira_start_field");
+  if (document.activeElement !== sf) sf.value = c.start_field || "";
+}
+
+// ---------- 日程・見積もりの同期 ----------
+const SYNC_FIELD_LABEL = { due: "期日（終了予定日）", start: "開始日（開始予定日）", estimate: "見積もり" };
+
+function sync_value(field, v) {
+  if (v === null || v === undefined) return "（なし）";
+  return field === "estimate" ? fmt_hours(Number(v)) : short_date(v);
+}
+
+async function compare_jira_fields() {
+  $("jira_fields").replaceChildren(el("p", { class: "empty_hint" }, "Jira と比べています…"));
+  try {
+    jira.fields = await api("GET", "/jira/fields");
+  } catch {
+    jira.fields = null;
+    $("jira_fields").replaceChildren();
+    return;
+  }
+  draw_jira_fields();
+}
+
+function draw_jira_fields() {
+  const r = jira.fields;
+  if (!r) return;
+  const box = $("jira_fields");
+  const parts = [];
+  if (!r.diffs.length) parts.push(el("p", { class: "empty_hint" }, "違いはありません"));
+  else {
+    parts.push(el("table", { class: "list_table jira_fields_table" },
+      el("thead", {}, el("tr", {}, el("th", {}, "タスク"), el("th", {}, "課題"), el("th", {}, "項目"), el("th", {}, "アプリ"), el("th", {}, "Jira"))),
+      el("tbody", {}, ...r.diffs.map((d) => el("tr", {},
+        el("td", {}, d.title), el("td", {}, jira_key_link(d.issue_key)), el("td", {}, SYNC_FIELD_LABEL[d.field]),
+        el("td", {}, sync_value(d.field, d.app)), el("td", {}, sync_value(d.field, d.jira)))))));
+    parts.push(el("div", { class: "jira_buttons" },
+      el("button", { type: "button", class: "small_button primary", onclick: () => sync_jira_fields("push") }, `アプリの値を Jira に送る（${r.diffs.length} 件）`),
+      el("button", { type: "button", class: "small_button", onclick: () => sync_jira_fields("pull") }, `Jira の値をアプリに取り込む（${r.diffs.length} 件）`)));
+  }
+  if (r.problems.length) {
+    parts.push(el("p", { class: "empty_hint warn" }, "比べられなかった課題："),
+      el("ul", { class: "jira_problems" }, ...r.problems.map((p) => el("li", {}, `${p.issue_key}（${p.title}）：${p.error}`))));
+  }
+  box.replaceChildren(...parts);
+}
+
+async function sync_jira_fields(direction) {
+  const r = jira.fields;
+  if (!r?.diffs.length) return;
+  const lines = r.diffs.map((d) => `${d.issue_key} ${SYNC_FIELD_LABEL[d.field]}：` +
+    (direction === "push" ? `${sync_value(d.field, d.jira)} → ${sync_value(d.field, d.app)}` : `${sync_value(d.field, d.app)} → ${sync_value(d.field, d.jira)}`)).join("\n");
+  const msg = direction === "push"
+    ? `アプリの値を Jira に送ります（Jira 側が書き換わります）。\n\n${lines}`
+    : `Jira の値をアプリに取り込みます（Ctrl+Z で戻せます）。\n\n${lines}`;
+  if (!confirm(msg)) return;
+  try {
+    const res = await api("POST", `/jira/fields/${direction}`, { expected: r.diffs });
+    const n = r.diffs.length - res.problems.length;
+    toast(res.problems.length
+      ? `${n} 件を${direction === "push" ? "送りました" : "取り込みました"}。${res.problems.length} 件はできませんでした：${res.problems.map((p) => p.issue_key).join("、")}`
+      : direction === "push" ? `✅ ${n} 件を Jira に送りました` : `✅ ${n} 件を Jira から取り込みました（Ctrl+Z で元に戻す）`,
+      res.problems.length ? "error" : "info");
+    if (direction === "pull") await reload();
+  } finally {
+    await compare_jira_fields();
+  }
 }
 
 // ---------- 紐付けとインポート ----------
@@ -252,8 +319,9 @@ function draw_jira_draft() {
 
 // ---------- 操作 ----------
 function setup_jira() {
+  $("jira_fields_compare").addEventListener("click", compare_jira_fields);
   $("jira_save").addEventListener("click", async () => {
-    const body = { base_url: $("jira_url").value };
+    const body = { base_url: $("jira_url").value, start_field: $("jira_start_field").value };
     const token = $("jira_token").value;
     if (token) body.token = token;
     jira.config = await api("PATCH", "/jira", body);

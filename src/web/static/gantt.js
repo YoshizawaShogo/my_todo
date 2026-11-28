@@ -352,7 +352,14 @@ function fit_gantt_day_width() {
   GANTT_DAY_W = Math.max(sc.dayW, Math.floor((avail / GANTT_DAYS) * 100) / 100);
 }
 
+let ganttRenderPending = false;
 function render_gantt() {
+  // バーをドラッグしている間は描き直さない（つかんでいる要素が消えてドラッグが途切れるため）。終わってから描き直す
+  if (document.body.classList.contains("gantt_dragging")) {
+    ganttRenderPending = true;
+    return;
+  }
+  ganttRenderPending = false;
   fix_step_button_widths();
   fit_gantt_day_width();
   compute_gantt_filter();
@@ -492,27 +499,28 @@ function draw_dependency_arrows(grid, rowsEl, ctx) {
     if (!a.end || !b.start) continue;
     const broken = dependency_broken(pre, post);
     const x1 = ctx.x_of(a.end) + GANTT_DAY_W;
-    // 同じ日に引き継ぐ（前が終わる日に後を始める）のは問題ないので、戻る線にしない
-    const x2 = broken ? ctx.x_of(b.start) : Math.max(ctx.x_of(b.start), x1);
+    // 矢印は必ず後のバーの始まりに向ける。始まりが先のバーの終わりより左なら（同じ日の引き継ぎや、先が完了して
+    // 問題でなくなったものも含め）戻る S 字で入る。赤くするのは問題があるとき（broken）だけ
+    const x2 = ctx.x_of(b.start);
+    const back = x2 - ARROW_LEN < x1;
     // 線は矢印の先の付け根の真ん中で終え、その先に矢印の先を描く（線が矢印の先に重ならないように）
     const y2 = rowY.get(post.id);
     const group = svg("g", { class: "dep" + (broken ? " broken" : "") });
     const path = svg("path", {
-      d: curve_path(x1, rowY.get(pre.id), x2 - ARROW_LEN, y2, broken),
+      d: curve_path(x1, rowY.get(pre.id), x2 - ARROW_LEN, y2, back),
       class: "dep_line" + (broken ? " broken" : ""),
     });
     group.append(path, arrow_head(x2, y2, "dep_head" + (broken ? " broken" : "")));
     const title = svg("title");
     title.textContent = `「${pre.title}」が終わってから「${post.title}」` +
-      (broken ? "\n順番が逆です（先のタスクが終わる前に始まる予定）" : "") + "\nクリックでこのつながりを外す";
+      (broken ? "\n順番が逆です（先のタスクが終わる前に始まる予定）" : "") + "\nクリックで右に詳しく出す（そこで外せる）";
     group.append(title);
+    if (state.selectedDep && state.selectedDep.pre === pre.id && state.selectedDep.post === post.id) group.classList.add("selected");
+    // クリックでこのつながりを選び、右の欄に「つながり」を出す
+    group.addEventListener("pointerdown", (ev) => ev.stopPropagation());
     group.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      if (post.status === "done") {
-        toast("完了したタスクの前のつながりは外せません（未完了に戻すと外せる）", "error");
-        return;
-      }
-      if (confirm(`「${pre.title}」→「${post.title}」のつながりを外しますか？`)) remove_dependency(pre.id, post.id);
+      select_dependency(pre.id, post.id);
     });
     layer.append(group);
   }
@@ -625,13 +633,8 @@ function inbox_row(t, depth, hasKids) {
     class: "twisty" + (hasKids ? "" : " leaf"),
     onclick: (ev) => { ev.stopPropagation(); toggle_collapse(t.id); },
   }, state.collapsed.has(t.id) ? "▸" : "▾");
-  const check = el("input", {
-    type: "checkbox",
-    title: done ? "チェックを外すと未着手に戻す" : "完了にする",
-    onclick: (ev) => ev.stopPropagation(),
-    onchange: (ev) => set_done(t, ev.target.checked),
-  });
-  check.checked = done;
+  // 完了のチェックボックスの代わりに、状態の印（表示だけ。状態は詳細欄で変える）
+  const check = status_mark(t);
   const label = el("span", {
     class: "label",
     title: "ダブルクリックで名前を変更・ドラッグで線表へ移す",
@@ -643,6 +646,7 @@ function inbox_row(t, depth, hasKids) {
   row.append(twisty, check, label,
     ...pinned_note(t),
     ...kind_badge(t),
+    ...estimate_badge(t),
     ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     ...(dates.length ? [el("span", { class: "date_chip" }, dates.join(" "))] : []),
@@ -675,13 +679,8 @@ function gantt_row(r, ctx) {
     class: "twisty" + (r.hasKids ? "" : " leaf"),
     onclick: (ev) => { ev.stopPropagation(); toggle_collapse(t.id); },
   }, state.collapsed.has(t.id) ? "▸" : "▾");
-  const check = el("input", {
-    type: "checkbox",
-    title: done ? "チェックを外すと未着手に戻す" : "完了にする",
-    onclick: (ev) => ev.stopPropagation(),
-    onchange: (ev) => set_done(t, ev.target.checked),
-  });
-  check.checked = done;
+  // 完了のチェックボックスの代わりに、状態の印（表示だけ。状態は詳細欄で変える）
+  const check = status_mark(t);
   const label = el("span", {
     class: "label",
     title: [...path_titles(t), t.title].join(" › ") + "\nダブルクリックで名前を変更・ドラッグで移動",
@@ -691,6 +690,7 @@ function gantt_row(r, ctx) {
     twisty, check, label,
     ...pinned_note(t),
     ...kind_badge(t),
+    ...estimate_badge(t),
     ...link_mark(t),
     ...tag_chips(t.tags, (n) => gantt.filter.tags.some((x) => same_tag(x, n)), toggle_gantt_tag, t.id),
     el("span", { class: "row_actions" },
@@ -870,8 +870,12 @@ function attach_gantt_drag(track, t, span, ctx) {
       label.style.top = `${e.clientY - 30}px`;
     };
 
+    let finished = false;
     const finish = (commit) => {
+      if (finished) return; // pointerup のあとに lostpointercapture も来るので 1 回だけ
+      finished = true;
       track.removeEventListener("pointermove", on_move);
+      track.removeEventListener("lostpointercapture", on_lost);
       track.removeEventListener("pointerup", on_up);
       track.removeEventListener("pointercancel", on_cancel);
       document.body.classList.remove("gantt_dragging", "drag_" + mode);
@@ -879,6 +883,7 @@ function attach_gantt_drag(track, t, span, ctx) {
       preview?.remove();
       original?.classList.remove("drag_source");
       show_trash(null);
+      if (ganttRenderPending) setTimeout(render_gantt, 0); // ドラッグ中に止めていた描き直し
       if (commit && moved && overTrash) {
         // ゴミ箱に入れた：日程だけ消す（タスクは残る）
         update(t.id, { planned_start: null, planned_end: null })
@@ -894,8 +899,12 @@ function attach_gantt_drag(track, t, span, ctx) {
     };
     const on_up = () => finish(true);
     const on_cancel = () => finish(false);
+    // ドラッグ中に線表が描き直される（定期の読み直し・幅の変化など）と、つかんでいた要素が消えて pointerup が届かない。
+    // そのときは捕まえていたポインターが外れるので、それを合図に片付ける（日付の吹き出しが残らないように）
+    const on_lost = () => finish(false);
     track.addEventListener("pointermove", on_move);
     track.addEventListener("pointerup", on_up);
     track.addEventListener("pointercancel", on_cancel);
+    track.addEventListener("lostpointercapture", on_lost);
   });
 }

@@ -1501,3 +1501,34 @@ body.dep_linking, body.dep_linking * { cursor: crosshair !important; }
 .detail input:disabled, .detail select:disabled { opacity: 0.65; cursor: not-allowed; }
 .bar.own.load_other, .bar.open_end.load_other { height: 10px; top: 10px; }
 .detail .effort_box[hidden] { display: none; }
+
+/* 行の先頭の状態の印（完了のチェックボックスの代わり） */
+.status_mark { display: inline-flex; width: 18px; justify-content: center; font-size: 12px; color: var(--muted); flex: none; cursor: default; }
+.status_mark.doing { color: var(--accent); }
+/* 見積もりがない札 */
+.estimate_badge { font-size: 11px; color: #b26a00; border: 1px solid #e0b060; border-radius: 8px; padding: 0 6px; margin-left: 4px; white-space: nowrap; }
+.legend_bar.other { background: repeating-linear-gradient(135deg, var(--panel) 0 3px, var(--bar_todo) 3px 5px); box-shadow: inset 0 0 0 1px var(--muted); }
+
+/* 選んでいるつながり */
+.dep.selected .dep_line { stroke-width: 3; opacity: 1; stroke: var(--accent); }
+.dep.selected .dep_head { fill: var(--accent); }
+.dep .dep_line, .dep .dep_head { cursor: pointer; }
+/* つながりの欄 */
+.dep_pane_body { display: flex; flex-direction: column; gap: 8px; }
+.dep_card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.dep_role { font-size: 11px; color: var(--muted); }
+.dep_task { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.dep_task .link_title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dep_dates, .dep_status { font-size: 12px; color: var(--muted); }
+.dep_status.warn { color: var(--danger); }
+.dep_arrow { text-align: center; color: var(--muted); }
+.dep_relation { margin: 0; font-size: 13px; }
+.dep_relation.broken { color: var(--danger); }
+.dep_task .link_title { color: var(--text); text-decoration: none; font-weight: 600; }
+.dep_task .link_title:hover { color: var(--accent); text-decoration: underline; }
+
+/* Jira：日程・見積もりの同期 */
+.jira_fields_table { margin: 0 16px 8px; width: calc(100% - 32px); }
+#jira_fields .jira_buttons { padding: 0 16px 8px; display: flex; gap: 8px; }
+.jira_problems { margin: 0 16px 8px; padding-left: 20px; font-size: 12px; color: var(--muted); }
+.empty_hint.flat { padding: 0; margin: 0; }

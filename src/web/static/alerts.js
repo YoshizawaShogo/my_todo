@@ -146,7 +146,8 @@ function draw_alert_panel(g) {
         },
       }, el("span", { class: "name" }, `${short_date(p.start)}〜${short_date(p.end)}`),
         el("span", { class: "note" }, `${fmt_hours(Math.round(p.total))} ／ 入るのは ${fmt_hours(p.cap)}（${p.tasks.length} 件）`))))),
-    section("見積もりなし", "線表に日程を入れた自分のタスク（見積もる癖をつけるため）", g.no_estimate.map((t) => task_item(t, t.planned_end ? `〜${short_date(t.planned_end)}` : `${short_date(t.planned_start)}〜`))),
+    section("見積もりなし", "自分の未完了のタスク（未分類も含む。見積もる癖をつけるため）", g.no_estimate.map((t) => task_item(t,
+      t.planned_end ? `〜${short_date(t.planned_end)}` : t.planned_start ? `${short_date(t.planned_start)}〜` : t.is_inbox && t.parent_id === null ? "未分類" : ""))),
     section("工数の記録漏れ", "今週の過ぎた平日で勤務時間が未記録", alerts.unrecorded.map((d) => el("li", {},
       el("button", {
         type: "button",

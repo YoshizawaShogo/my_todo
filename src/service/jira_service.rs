@@ -16,12 +16,32 @@ use super::{ServiceError, ServiceResult, SettingKey, now_text, task_service};
 pub struct JiraConfig {
     /// 例：https://jira.example.co.jp（末尾の / は除く）
     pub base_url: Option<String>,
+    /// 開始日に使う項目（例：customfield_10015）。なければ開始日は同期しない
+    pub start_field: Option<String>,
 }
 
 pub fn get_config(conn: &Connection) -> ServiceResult<JiraConfig> {
     Ok(JiraConfig {
         base_url: super::get_setting(conn, SettingKey::JiraBaseUrl)?.filter(|s| !s.is_empty()),
+        start_field: super::get_setting(conn, SettingKey::JiraStartField)?
+            .filter(|s| !s.is_empty()),
     })
+}
+
+/// 開始日に使う項目を保存する（customfield_数字 の形だけ受け付ける。空なら同期しない）
+pub fn set_start_field(conn: &Connection, field: &str) -> ServiceResult<JiraConfig> {
+    let field = field.trim();
+    let ok = field.is_empty()
+        || field
+            .strip_prefix("customfield_")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if !ok {
+        return Err(ServiceError::Invalid(
+            "開始日の項目は customfield_10015 のような形で入れてください（Jira の管理画面や課題の JSON で確かめられます）".into(),
+        ));
+    }
+    super::set_setting(conn, SettingKey::JiraStartField, field)?;
+    get_config(conn)
 }
 
 /// PAT を平文で流さないよう、https:// だけを受け付ける（http:// はこの PC の中だけ）。

@@ -120,6 +120,8 @@ str_enum! {
         DefaultWorkMin => "default_work_min",
         /// Jira の URL
         JiraBaseUrl => "jira_base_url",
+        /// Jira で開始日に使う項目（会社ごとの独自の項目。例：customfield_10015）。空なら開始日は同期しない
+        JiraStartField => "jira_start_field",
     }
 }
 

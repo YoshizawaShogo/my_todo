@@ -299,13 +299,8 @@ function list_row(t, today) {
     "data-task_id": t.id,
     onclick: () => select(t.id),
   });
-  const check = el("input", {
-    type: "checkbox",
-    title: done ? "チェックを外すと未着手に戻す" : "完了にする",
-    onclick: (ev) => ev.stopPropagation(),
-    onchange: (ev) => set_done(t, ev.target.checked),
-  });
-  check.checked = done;
+  // 完了のチェックボックスの代わりに、状態の印（表示だけ。状態は詳細欄で変える）
+  const check = status_mark(t);
   const path = path_titles(t);
   const title = el("span", {
     class: "title",
@@ -314,6 +309,7 @@ function list_row(t, today) {
   }, t.title);
   const nameCell = el("td", { class: "col_title" },
     el("div", { class: "title_line" }, title,
+      ...estimate_badge(t),
       ...link_mark(t),
       ...tag_chips(t.tags, (n) => list.filter.tags.some((x) => same_tag(x, n)), (n) => { toggle_in(list.filter.tags, n); list.filter.untagged = false; save_list_filter(); })),
     el("div", { class: "crumb" }, path.length ? path.join(" › ") : t.is_inbox ? "未分類" : ""));

@@ -15,6 +15,7 @@ const state = {
   dragIds: null, // ドラッグ中のタスク（複数選択ならすべて、画面の並び順）
   dragTag: null, // 絞り込みのタグを運んでいるときのタグ名（タスクへ落とすと付ける）
   dragTagFrom: null, // タスクに付いているタグを運んでいるときの、そのタスクの id（ゴミ箱で外す）
+  selectedDep: null, // 選んでいるつながり { pre, post }（矢印をクリック）
   tab: load_json("tab", "gantt"), // gantt / list
   collapsed: new Set(load_json("collapsed", [])),
   dragId: null,
@@ -198,11 +199,6 @@ async function update(id, patch) {
   const t = await api("PATCH", `/tasks/${id}`, patch);
   await reload();
   return t;
-}
-
-async function set_done(task, done) {
-  await update(task.id, { status: done ? "done" : "todo" });
-  if (done) toast(`✅「${task.title}」を完了にしました（Ctrl+Z で元に戻す）`);
 }
 
 async function remove(id) {
@@ -718,11 +714,23 @@ function too_heavy(t) {
   return Boolean(l && t.status !== "done" && l.perDay > day_capacity());
 }
 
-/// 見積もりの入っていない、線表に日程のある自分の未完了タスクか（子に見積もりがあれば数えない）
+/// 見積もりの入っていない自分の未完了タスクか（未分類や日程のないものも含む。子に見積もりがあれば数えない）
 function needs_estimate(t) {
-  if (t.status === "done" || t.kind === "external" || (t.parent_id === null && t.is_inbox)) return false;
-  if (!t.planned_start && !t.planned_end) return false;
+  if (t.status === "done" || t.kind === "external") return false;
   return !task_estimate(t);
+}
+
+const STATUS_MARK = { todo: ["○", "未着手"], doing: ["◐", "作業中"], done: ["✅", "完了"] };
+
+/// 行の先頭の状態の印（表示だけ。状態は詳細欄で変える）
+function status_mark(t) {
+  const [mark, label] = STATUS_MARK[t.status] || ["", ""];
+  return el("span", { class: "status_mark " + t.status, title: `${label}（状態は右の詳細欄で変える）` }, mark);
+}
+
+/// 見積もりがないことを行に出す札
+function estimate_badge(t) {
+  return needs_estimate(t) ? [el("span", { class: "estimate_badge", title: "見積もりがありません。右の詳細欄の「見積もり」に入れてください" }, "見積もりなし")] : [];
 }
 
 /// 詰め込みすぎの期間：その期間の中に期間がまるごと収まるタスクの残りの見積もりの合計が、
@@ -829,6 +837,7 @@ function render() {
   }
   for (const name of TABS) $("view_" + name).hidden = state.tab !== name;
   $("review_pane").hidden = state.tab !== "review";
+  if (state.selectedDep && !dep_of_selected()) clear_dep_selection(); // 外れた・タスクが消えたつながり
   // タブの描画で例外が起きても、詳細パネル（選択の解除・消したタスクを閉じる）は必ず描き直す
   try {
     render_alerts();
@@ -1032,7 +1041,86 @@ function attach_group_drop(rowEl, key) {
 
 // ---------- 詳細パネル ----------
 /// タスクを選ぶ。クリックで 1 件、Shift＋クリックで範囲、Ctrl（Mac は ⌘）＋クリックで足す・外す
+/// つながりの選択を外す。選択を外すときは必ずここを通し、矢印の強調も戻す
+/// （行のタスクを選んだときのように、線表を描き直さない経路もあるため、ここで直接戻す）
+function clear_dep_selection() {
+  state.selectedDep = null;
+  document.querySelectorAll("#gantt .dep.selected").forEach((g) => g.classList.remove("selected"));
+}
+
+/// つながりを選ぶ（タスクの選択は外す）。右の欄に「つながり」を出す
+function select_dependency(pre, post) {
+  state.selectedDep = { pre, post };
+  state.selected = new Set();
+  state.selectedId = null;
+  state.anchorId = null;
+  render();
+}
+
+/// 選んでいるつながり { pre, post }（タスクの本体）。なければ null
+function dep_of_selected() {
+  const d = state.selectedDep;
+  if (!d) return null;
+  const pre = state.byId.get(d.pre), post = state.byId.get(d.post);
+  return pre && post && (post.depends_on || []).includes(pre.id) ? { pre, post } : null;
+}
+
+/// 右の「つながり」の欄：先（From）と後（To）の状態と日程、関係、外すボタン
+function render_dep_pane() {
+  const pane = $("dep_pane");
+  const dep = state.tab === "gantt" ? dep_of_selected() : null;
+  pane.hidden = !dep;
+  if (!dep) return;
+  const { pre, post } = dep;
+  const today = today_text();
+  const card = (t, role) => {
+    const { start, end } = span_of(t);
+    const a = task_alerts(t, today);
+    const status = t.status === "done"
+      ? `完了${t.completed_at ? `（${short_date(t.completed_at.slice(0, 10))}）` : ""}`
+      : a.overdue ? "期限切れ" : a.late_start ? "開始遅れ" : t.status === "doing" ? "作業中" : "未着手";
+    return el("div", { class: "dep_card" },
+      el("div", { class: "dep_role" }, role),
+      el("div", { class: "dep_task" },
+        status_mark(t),
+        el("a", { href: "#", class: "link_title", title: "クリックでこのタスクを選ぶ", onclick: (ev) => { ev.preventDefault(); select(t.id); } }, t.title)),
+      el("div", { class: "dep_dates" }, `${start ? short_date(start) : "—"} 〜 ${end ? short_date(end) : "—"}`),
+      el("div", { class: "dep_status" + (a.overdue || a.late_start ? " warn" : "") }, status));
+  };
+  const a = dep_dates(pre), b = dep_dates(post);
+  const relation = pre.status === "done"
+    ? ["ok", "先のタスクは完了しています"]
+    : dependency_broken(pre, post)
+      ? ["broken", `順番が逆です：先が ${short_date(a.end)} に終わる予定なのに、後は ${short_date(b.start)} に始まる予定`]
+      : a.end && b.start ? ["ok", "順番どおりです"] : ["", "日程が入っていないので、順番は確かめられません"];
+  const locked = post.status === "done";
+  $("dep_pane_body").replaceChildren(el("div", { class: "dep_pane_body" },
+    card(pre, "先（From）"),
+    el("div", { class: "dep_arrow" }, "↓"),
+    card(post, "後（To）"),
+    el("p", { class: "dep_relation " + relation[0] }, relation[1]),
+    el("button", {
+      type: "button",
+      class: "danger_button",
+      disabled: locked,
+      title: locked ? "後のタスクが完了しているので外せません（未完了に戻すと外せる）" : "Delete キーでも外せる",
+      onclick: () => remove_selected_dependency(),
+    }, "🗑️ このつながりを外す")));
+}
+
+async function remove_selected_dependency() {
+  const dep = dep_of_selected();
+  if (!dep) return;
+  if (dep.post.status === "done") {
+    toast("後のタスクが完了しているので外せません（未完了に戻すと外せる）", "error");
+    return;
+  }
+  clear_dep_selection();
+  await remove_dependency(dep.pre.id, dep.post.id);
+}
+
 function select(id, ev) {
+  if (id !== null && state.selectedDep) clear_dep_selection();
   if (id === null) {
     state.selected = new Set();
     state.selectedId = null;
@@ -1097,7 +1185,10 @@ function render_detail_deps(task) {
       el("ul", { class: "link_list" }, ...posts.map((p) => item(p, () => remove_dependency(task.id, p.id), dependency_broken(task, p))))]
     : []));
   const taken = new Set([task.id, ...pres.map((p) => p.id)]);
-  $("dep_options").replaceChildren(...state.tasks.filter((t) => !taken.has(t.id)).map((t) => el("option", { value: task_option_label(t) })));
+  // 候補はまだ終わっていないタスクだけ（完了したものも、名前を入れればつなげる）
+  $("dep_options").replaceChildren(...state.tasks
+    .filter((t) => !taken.has(t.id) && t.status !== "done")
+    .map((t) => el("option", { value: task_option_label(t) })));
 }
 
 /// 関連資料の一覧。名前をクリックで開く（新しいタブ）、ダブルクリックで名前を変える、× で外す
@@ -1157,7 +1248,8 @@ function render_detail() {
   const task = state.selectedId === null ? null : state.byId.get(state.selectedId);
   panel.querySelector(".detail_header h2").textContent = state.selected.size > 1 ? `詳細（${state.selected.size} 件選択中）` : "詳細";
   // 詳細の欄は、タスクを選べるタブでは最初から場所を取っておく（選んだときに左の配置がずれないように）
-  panel.hidden = !["gantt", "list", "work"].includes(state.tab);
+  panel.hidden = !["gantt", "list", "work"].includes(state.tab) || Boolean(state.tab === "gantt" && dep_of_selected());
+  render_dep_pane();
   $("detail_body").hidden = !task;
   $("detail_empty").hidden = Boolean(task);
   $("detail_close").hidden = !task;
@@ -1324,6 +1416,7 @@ function setup_detail() {
   $("detail_tag_box").addEventListener("click", () => tagInput.focus());
 
   $("detail_close").addEventListener("click", () => select(null));
+  $("dep_close").addEventListener("click", () => { clear_dep_selection(); render_detail(); });
   $("detail_title").addEventListener("change", (ev) => {
     const v = ev.target.value.trim();
     if (v) update(state.selectedId, { title: v });
@@ -1486,6 +1579,12 @@ function setup() {
     } else if (ev.key === "F2" && !typing && !mod) {
       ev.preventDefault();
       rename_by_f2();
+    } else if (ev.key === "Delete" && !typing && !mod && state.tab === "gantt" && state.selectedDep) {
+      ev.preventDefault();
+      remove_selected_dependency();
+    } else if (ev.key === "Escape" && !typing && state.selectedDep) {
+      clear_dep_selection();
+      render_detail();
     } else if (ev.key === "Delete" && !typing && !mod && state.tab === "gantt" && state.selected.size > 0) {
       ev.preventDefault();
       delete_tasks_confirm(visible_task_order().filter((id) => state.selected.has(id)));
@@ -1512,6 +1611,11 @@ function setup() {
   setup_templates();
   setup_review();
   setup_tag_drop();
+  // 念のため：ドラッグしていないのに日付の吹き出し・ゴミ箱が残っていたら、次に押したときに片付ける
+  document.addEventListener("pointerdown", () => {
+    if (document.body.classList.contains("gantt_dragging")) return;
+    document.querySelectorAll(".drag_label").forEach((e) => e.remove());
+  }, true);
   // 落とし先（行・見出し）の外に出たら、前後の線や枠の印を消す
   document.addEventListener("dragover", (ev) => {
     if (dropMark.el && !(ev.target instanceof Element && ev.target.closest("[data-task_id], .gantt_header .gantt_name, #inbox_header"))) clear_drop_marks();
